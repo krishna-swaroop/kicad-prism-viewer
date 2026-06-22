@@ -26,7 +26,9 @@
     colorMode: "layer",
     visibleLayers: new Set(),
     activeNetId: 0,
+    activeNetClassId: 0,
     selectedFeatureId: 0,
+    lastPickId: 0,
     showBoard: true,
     showComponents: true,
     showUnmapped: true,
@@ -55,9 +57,12 @@
 
   const scene = {
     manifest: null,
+    isSemanticGltf: false,
     features: [],
     featureGpuData: null,
     nets: [],
+    netClasses: [{ id: 0, name: "" }],
+    netClassIds: null,
     layers: [],
     chunksById: new Map(),
     resident: new Map(),
@@ -85,6 +90,7 @@
   let featureBuffer;
   let layerColorBuffer;
   let netColorBuffer;
+  let netClassBuffer;
   let layerOffsetBuffer;
   let depthTexture;
   let pickTexture;
@@ -289,13 +295,111 @@ self.onmessage = async (event) => {
     if (!path) throw new Error("No semantic scene manifest is present");
     statusEl.textContent = "Loading scene manifest";
     scene.manifest = await fetchJson(path);
-    if (!["prism.semantic_scene_a3", "prism.semantic_scene_a4"].includes(scene.manifest.schema)) {
+    if (!["prism.semantic_scene_a3", "prism.semantic_scene_a4", "prism.semantic_gltf_a0"].includes(scene.manifest.schema)) {
       throw new Error(`Unsupported scene schema: ${scene.manifest.schema}`);
     }
+    scene.isSemanticGltf = scene.manifest.schema === "prism.semantic_gltf_a0";
     scene.nets = scene.manifest.nets || [];
+    const classIdByName = new Map();
+    scene.netClasses = [{ id: 0, name: "" }];
+    scene.netClassIds = new Uint32Array(Math.max(128, scene.nets.length + 2));
+    for (const net of scene.nets) {
+      const name = String(net.netClass || net.net_class || "");
+      if (!name) continue;
+      if (!classIdByName.has(name)) {
+        const id = scene.netClasses.length;
+        classIdByName.set(name, id);
+        scene.netClasses.push({ id, name });
+      }
+      net.netClassId = classIdByName.get(name);
+      scene.netClassIds[Number(net.id || 0)] = net.netClassId;
+    }
     scene.layers = scene.manifest.layers || [];
     scene.bboxMin = scene.manifest.bbox?.min || [0, 0, 0];
     scene.bboxMax = scene.manifest.bbox?.max || [1, 1, 1];
+    if (scene.isSemanticGltf) {
+      const manifestUrl = assetUrl(path);
+      const copperIds = scene.manifest.copperLayerIds || [];
+      scene.manifest.copper_layer_ids = copperIds;
+      scene.manifest.net_to_chunks = scene.manifest.netToTiles || {};
+      scene.manifest.kinds = KIND;
+      for (const tile of scene.manifest.tiles || []) {
+        scene.chunksById.set(tile.id, {
+          ...tile,
+          class: "copper",
+          layer_id: Number(tile.layerId),
+          path: new URL(tile.path, manifestUrl).toString(),
+          lod: "solid",
+          raw_bytes: Number(tile.bytes || 0),
+        });
+      }
+      const features = [...(scene.manifest.objectFeatures || [])];
+      let maxFeatureId = features.reduce((maximum, feature) => Math.max(maximum, Number(feature.id || 0)), 0);
+      const boardLayer = scene.layers.find((layer) => layer.name === "Board") || { id: 0 };
+      const boardFeatureId = ++maxFeatureId;
+      const componentFeatureId = ++maxFeatureId;
+      features.push(
+        {
+          id: boardFeatureId,
+          sourceUid: "context:board",
+          netId: 0,
+          layerId: Number(boardLayer.id || 0),
+          kind: "board",
+        },
+        {
+          id: componentFeatureId,
+          sourceUid: "context:components",
+          netId: 0,
+          layerId: 0,
+          kind: "component",
+        },
+      );
+      const baseBoard = semanticGeometry.assets?.base_board_glb;
+      const components = semanticGeometry.assets?.components_glb;
+      if (baseBoard) {
+        scene.chunksById.set("context:board", {
+          id: "context:board",
+          class: "board",
+          layer_id: Number(boardLayer.id || 0),
+          path: assetUrl(baseBoard),
+          lod: "solid",
+          defaultFeatureId: boardFeatureId,
+        });
+      }
+      if (components) {
+        scene.chunksById.set("context:components", {
+          id: "context:components",
+          class: "component",
+          layer_id: 0,
+          path: assetUrl(components),
+          lod: "solid",
+          defaultFeatureId: componentFeatureId,
+        });
+      }
+      scene.features = new Array(maxFeatureId + 1);
+      const gpu = new Uint32Array((maxFeatureId + 1) * 4);
+      for (const feature of features) {
+        const id = Number(feature.id || 0);
+        const layerId = Number(feature.layerId || 0);
+        const layerIndex = copperIds.indexOf(layerId);
+        const kind = feature.kind === "track_arc" ? "track" : String(feature.kind || "unknown");
+        const normalized = {
+          objectId: id,
+          netId: Number(feature.netId || 0),
+          layerMask: layerIndex >= 0 && layerIndex < 32 ? (1 << layerIndex) >>> 0 : 0,
+          primaryLayerId: layerId,
+          kindId: KIND[kind] || 0,
+          kind,
+          sourceUid: String(feature.sourceUid || ""),
+          designator: String(feature.designator || ""),
+        };
+        scene.features[id] = normalized;
+        gpu.set([normalized.netId, normalized.layerMask, normalized.primaryLayerId, normalized.kindId], id * 4);
+      }
+      scene.featureGpuData = gpu;
+      state.visibleLayers.add(defaultLayerId());
+      return;
+    }
     scene.componentGroups = scene.manifest.component_groups || [];
     for (const chunk of scene.manifest.chunks || []) scene.chunksById.set(chunk.id, chunk);
     parseFeatures(await fetchBytes(scene.manifest.features.path));
@@ -363,8 +467,8 @@ self.onmessage = async (event) => {
     return [
       2 / (right - left), 0, 0, 0,
       0, 2 / (top - bottom), 0, 0,
-      0, 0, -2 / (far - near), 0,
-      -(right + left) / (right - left), -(top + bottom) / (top - bottom), -(far + near) / (far - near), 1,
+      0, 0, 1 / (near - far), 0,
+      -(right + left) / (right - left), -(top + bottom) / (top - bottom), near / (near - far), 1,
     ];
   }
 
@@ -396,7 +500,7 @@ self.onmessage = async (event) => {
         sx, 0, 0, 0, 0, 0, sz, 0, 0, sy, 0, 0,
         -target[0] * sx,
         -target[2] * sy,
-        -((scene.bboxMin[1] + scene.bboxMax[1]) / 2) * sz,
+        -scene.bboxMax[1] * sz,
         1,
       ];
     }
@@ -450,14 +554,18 @@ self.onmessage = async (event) => {
       existing.lastUsed = performance.now();
       return existing;
     }
-    const parsed = parseChunk(await loadCompressed(entry.path, entry.raw_bytes));
+    const parsed = scene.isSemanticGltf
+      ? await loadSemanticGltfChunk(entry)
+      : parseChunk(await loadCompressed(entry.path, entry.raw_bytes));
     const resident = {
       entry,
       vertexBuffer: createMappedBuffer(parsed.vertexBytes, GPUBufferUsage.VERTEX),
       indexBuffer: createMappedBuffer(parsed.indexBytes, GPUBufferUsage.INDEX),
       indexCount: parsed.indexCount,
+      indexFormat: parsed.indexFormat || "uint16",
       bboxMin: parsed.bboxMin,
       bboxScale: parsed.bboxMax.map((value, index) => value - parsed.bboxMin[index]),
+      byteSize: parsed.vertexBytes.byteLength + parsed.indexBytes.byteLength,
       lastUsed: performance.now(),
     };
     const transformData = new Float32Array([
@@ -470,10 +578,70 @@ self.onmessage = async (event) => {
       entries: [{ binding: 0, resource: { buffer: resident.transformBuffer } }],
     });
     scene.resident.set(entry.id, resident);
-    scene.residentBytes += parsed.vertexBytes.byteLength + parsed.indexBytes.byteLength;
+    scene.residentBytes += resident.byteSize;
     scene.triangles += parsed.indexCount / 3;
     evictHiddenChunks();
     return resident;
+  }
+
+  async function loadSemanticGltfChunk(entry) {
+    if (!globalThis.PrismSemanticGltfLoader) throw new Error("Semantic GLB loader is unavailable");
+    const loaded = await globalThis.PrismSemanticGltfLoader.load(entry.path, entry.defaultFeatureId || 0);
+    scene.downloadedBytes += loaded.byteLength;
+    const primitives = loaded.primitives || [];
+    const vertexCount = primitives.reduce((total, primitive) => total + primitive.position.length / 3, 0);
+    const indexCount = primitives.reduce((total, primitive) => total + primitive.indices.length, 0);
+    const positions = new Float32Array(vertexCount * 3);
+    const normals = new Float32Array(vertexCount * 3);
+    const featureIds = new Uint32Array(vertexCount);
+    const indices = vertexCount <= 65535 ? new Uint16Array(indexCount) : new Uint32Array(indexCount);
+    let vertexOffset = 0;
+    let indexOffset = 0;
+    for (const primitive of primitives) {
+      const count = primitive.position.length / 3;
+      positions.set(primitive.position, vertexOffset * 3);
+      normals.set(primitive.normal, vertexOffset * 3);
+      for (let index = 0; index < count; index += 1) {
+        featureIds[vertexOffset + index] = Number(primitive.objectFeatureId[index] || 0);
+      }
+      for (let index = 0; index < primitive.indices.length; index += 1) {
+        indices[indexOffset + index] = Number(primitive.indices[index]) + vertexOffset;
+      }
+      vertexOffset += count;
+      indexOffset += primitive.indices.length;
+    }
+    const bboxMin = [Infinity, Infinity, Infinity];
+    const bboxMax = [-Infinity, -Infinity, -Infinity];
+    for (let index = 0; index < vertexCount; index += 1) {
+      for (let axis = 0; axis < 3; axis += 1) {
+        const value = positions[index * 3 + axis];
+        bboxMin[axis] = Math.min(bboxMin[axis], value);
+        bboxMax[axis] = Math.max(bboxMax[axis], value);
+      }
+    }
+    const scale = bboxMax.map((value, axis) => Math.max(value - bboxMin[axis], 1e-9));
+    const vertexBytes = new Uint8Array(vertexCount * VERTEX_STRIDE);
+    const view = new DataView(vertexBytes.buffer);
+    for (let index = 0; index < vertexCount; index += 1) {
+      const offset = index * VERTEX_STRIDE;
+      for (let axis = 0; axis < 3; axis += 1) {
+        const normalized = (positions[index * 3 + axis] - bboxMin[axis]) / scale[axis];
+        view.setUint16(offset + axis * 2, Math.round(Math.max(0, Math.min(1, normalized)) * 65535), true);
+        view.setInt8(offset + 8 + axis, Math.round(Math.max(-1, Math.min(1, normals[index * 3 + axis])) * 127));
+      }
+      view.setUint16(offset + 6, 65535, true);
+      view.setInt8(offset + 11, 127);
+      view.setUint32(offset + 12, featureIds[index], true);
+    }
+    return {
+      vertexCount,
+      indexCount,
+      bboxMin,
+      bboxMax,
+      vertexBytes,
+      indexBytes: new Uint8Array(indices.buffer),
+      indexFormat: indices instanceof Uint16Array ? "uint16" : "uint32",
+    };
   }
 
   async function ensureComponentGroup(group, index) {
@@ -508,6 +676,23 @@ self.onmessage = async (event) => {
 
   function visibleEntries() {
     const all = [...scene.chunksById.values()];
+    if (scene.isSemanticGltf) {
+      if (state.orthoLocked) {
+        return all.filter((entry) => (
+          entry.class === "copper"
+          && state.visibleLayers.has(Number(entry.layer_id))
+        ));
+      }
+      const context = all.filter((entry) => (
+        (entry.class === "board" && state.showBoard)
+        || (entry.class === "component" && state.showComponents)
+      ));
+      if (state.isolateNet && state.activeNetId) {
+        const ids = new Set(scene.manifest.net_to_chunks?.[String(state.activeNetId)] || []);
+        return [...context, ...all.filter((entry) => entry.class === "copper" && ids.has(entry.id))];
+      }
+      return [...context, ...all.filter((entry) => entry.class === "copper")];
+    }
     if (state.orthoLocked) {
       return all.filter((entry) => {
         const isSelected = state.visibleLayers.has(Number(entry.layer_id));
@@ -521,8 +706,10 @@ self.onmessage = async (event) => {
   async function loadActiveScene() {
     const started = performance.now();
     statusEl.textContent = "Streaming geometry";
-    const board = [...scene.chunksById.values()].filter((entry) => entry.class === "board" && entry.lod === "solid");
-    await Promise.all(board.map(ensureChunk));
+    if (!scene.isSemanticGltf && !state.orthoLocked) {
+      const board = [...scene.chunksById.values()].filter((entry) => entry.class === "board" && entry.lod === "solid");
+      await Promise.all(board.map(ensureChunk));
+    }
     
     const visible = visibleEntries();
     for (const batch of batches(visible, 6)) await Promise.all(batch.map(ensureChunk));
@@ -555,7 +742,8 @@ self.onmessage = async (event) => {
       item.indexBuffer.destroy();
       item.transformBuffer.destroy();
       scene.resident.delete(item.entry.id);
-      scene.residentBytes -= Number(item.entry.raw_bytes || 0);
+      scene.residentBytes -= item.byteSize;
+      scene.triangles -= item.indexCount / 3;
     }
   }
 
@@ -569,20 +757,47 @@ self.onmessage = async (event) => {
     const length = Math.max(128, items.length + 2);
     const data = new Float32Array(length * 4);
     for (let index = 0; index < length; index += 1) data.set(fallback, index * 4);
-    for (const item of items) data.set(item.color || fallback, Number(item.id || 0) * 4);
+    for (const item of items) data.set(gpuColor(item, fallback), Number(item.id || 0) * 4);
     return data;
+  }
+
+  function gpuColor(item, fallback) {
+    const layerColors = {
+      "F.Cu": [0.86, 0.16, 0.12, 1],
+      "B.Cu": [0.10, 0.32, 0.82, 1],
+    };
+    if (layerColors[item.name]) return layerColors[item.name];
+    if (Array.isArray(item.color)) return item.color;
+    if (typeof item.color === "string" && /^#[0-9a-f]{6}$/i.test(item.color)) {
+      return [
+        Number.parseInt(item.color.slice(1, 3), 16) / 255,
+        Number.parseInt(item.color.slice(3, 5), 16) / 255,
+        Number.parseInt(item.color.slice(5, 7), 16) / 255,
+        1,
+      ];
+    }
+    if (item.id && item.uid !== undefined) {
+      const hue = (Number(item.id) * 0.61803398875) % 1;
+      return [
+        0.42 + 0.38 * Math.abs(Math.sin(hue * Math.PI * 2)),
+        0.42 + 0.38 * Math.abs(Math.sin((hue + 0.33) * Math.PI * 2)),
+        0.42 + 0.38 * Math.abs(Math.sin((hue + 0.66) * Math.PI * 2)),
+        1,
+      ];
+    }
+    return fallback;
   }
 
   function layerOffsets() {
     const data = new Float32Array(Math.max(128, scene.layers.length + 2));
-    const copper = scene.manifest.copper_layer_ids || [];
+    const copper = scene.manifest.copper_layer_ids || scene.manifest.copperLayerIds || [];
     const center = (copper.length - 1) / 2;
     copper.forEach((layerId, index) => { data[layerId] = (center - index) * 0.0005; });
     return data;
   }
 
   function selectedLayerMask() {
-    const copper = scene.manifest.copper_layer_ids || [];
+    const copper = scene.manifest.copper_layer_ids || scene.manifest.copperLayerIds || [];
     let mask = 0;
     for (const id of state.visibleLayers) {
       const index = copper.indexOf(id);
@@ -606,7 +821,7 @@ self.onmessage = async (event) => {
       state.orthoLocked ? 0 : 1,
     ]);
     new Uint32Array(data, 80, 4).set([
-      0,
+      state.activeNetClassId,
       selectedLayerMask(),
       flags,
       0,
@@ -649,12 +864,14 @@ self.onmessage = async (event) => {
 
   function selectionPayload(featureId, worldPosition) {
     const feature = featureById(featureId);
-    if (!feature || !feature.objectId) return null;
+    if (!feature || (!feature.objectId && !feature.sourceUid)) return null;
     const sourceObject = resolveSourceObject(feature, worldPosition);
     const net = netById(feature.netId);
     const layer = layerById(sourceObject?.layerId ?? feature.primaryLayerId);
     const kindId = sourceObject?.kindId ?? feature.kindId;
-    const kind = Object.entries(scene.manifest.kinds || {}).find(([, id]) => Number(id) === kindId)?.[0] || "unknown";
+    const kind = feature.kind
+      || Object.entries(scene.manifest.kinds || {}).find(([, id]) => Number(id) === kindId)?.[0]
+      || "unknown";
     const sourceUid = sourceObject?.sourceUid || feature.sourceUid;
     const payload = {
       objectId: sourceUid || `feature:${featureId}`,
@@ -662,7 +879,16 @@ self.onmessage = async (event) => {
       layer: layer.name,
       sourceIds: sourceUid ? [sourceUid] : [],
     };
-    if (net?.uid) Object.assign(payload, { netUid: net.uid, netName: net.name });
+    if (net?.uid) {
+      Object.assign(payload, {
+        netUid: net.uid,
+        netName: net.name,
+        netClass: net.netClass || "",
+        traceLengthMm: net.metrics?.traceLengthMm ?? null,
+        netLayers: net.metrics?.layers || [],
+        objectCounts: net.metrics?.objectCounts || {},
+      });
+    }
     const designator = sourceObject?.designator || feature.designator;
     if (designator) payload.designator = designator;
     return payload;
@@ -674,13 +900,17 @@ self.onmessage = async (event) => {
     const payload = selectionPayload(featureId, hit?.worldPosition);
     if (!payload) {
       state.activeNetId = 0;
+      state.activeNetClassId = 0;
       selectionEl.textContent = "No object selected";
       renderControls();
       return;
     }
     const feature = featureById(featureId);
     state.activeNetId = feature.netId || 0;
-    if (state.activeNetId) await loadNetChunks(state.activeNetId);
+    state.activeNetClassId = 0;
+    if (state.activeNetId && !state.orthoLocked && state.isolateNet) {
+      await loadNetChunks(state.activeNetId);
+    }
     selectionEl.textContent = JSON.stringify(payload, null, 2);
     renderControls();
     window.dispatchEvent(new CustomEvent("prism-viz:select", { detail: payload }));
@@ -704,28 +934,30 @@ self.onmessage = async (event) => {
     }
     layersEl.append(toolbar);
 
-    const layerList = document.createElement("div");
-    layerList.className = "layer-list";
-    for (const layer of scene.layers.filter((item) => isCopperLayer(item) || item.role === "silkscreen" || item.role === "edge_cuts")) {
-      const row = document.createElement("label");
-      const isVisible = state.visibleLayers.has(Number(layer.id));
-      row.className = isVisible ? "layer-chip active" : "layer-chip";
-      row.innerHTML = `
-        <input type="checkbox" ${isVisible ? "checked" : ""}>
-        <span class="swatch" style="background:${rgbaCss(layer.color)}"></span>
-        <span class="layer-name">${escapeHtml(layer.name)}</span>
-      `;
-      row.querySelector("input").addEventListener("change", async (e) => {
-        if (e.target.checked) state.visibleLayers.add(Number(layer.id));
-        else state.visibleLayers.delete(Number(layer.id));
-        state.selectedFeatureId = 0;
-        selectionEl.textContent = "No object selected";
-        renderControls();
-        await loadActiveScene();
-      });
-      layerList.append(row);
+    if (state.orthoLocked) {
+      const layerList = document.createElement("div");
+      layerList.className = "layer-list";
+      for (const layer of scene.layers.filter(isCopperLayer)) {
+        const row = document.createElement("label");
+        const isVisible = state.visibleLayers.has(Number(layer.id));
+        row.className = isVisible ? "layer-chip active" : "layer-chip";
+        row.innerHTML = `
+          <input type="radio" name="active-layer" ${isVisible ? "checked" : ""}>
+          <span class="swatch" style="background:${rgbaCss(gpuColor(layer, [0.5, 0.5, 0.5, 1]))}"></span>
+          <span class="layer-name">${escapeHtml(layer.name)}</span>
+        `;
+        row.querySelector("input").addEventListener("change", async () => {
+          state.visibleLayers.clear();
+          state.visibleLayers.add(Number(layer.id));
+          state.selectedFeatureId = 0;
+          selectionEl.textContent = "No object selected";
+          renderControls();
+          await loadActiveScene();
+        });
+        layerList.append(row);
+      }
+      layersEl.append(controlField("Active layer", layerList));
     }
-    layersEl.append(controlField("Visible layers", layerList));
 
     const colorSelect = document.createElement("select");
     colorSelect.className = "layer-select";
@@ -752,14 +984,36 @@ self.onmessage = async (event) => {
     }
     netSelect.addEventListener("change", async () => {
       state.activeNetId = Number(netSelect.value || 0);
+      state.activeNetClassId = 0;
       state.selectedFeatureId = 0;
       if (!state.activeNetId) state.isolateNet = false;
-      if (state.activeNetId) await loadNetChunks(state.activeNetId);
+      if (state.activeNetId && !state.orthoLocked && state.isolateNet) {
+        await loadNetChunks(state.activeNetId);
+      }
       renderControls();
     });
     layersEl.append(controlField("Net highlight", netSelect));
 
-    if (state.mode === "orbit") {
+    const classSelect = document.createElement("select");
+    classSelect.className = "net-select";
+    classSelect.innerHTML = '<option value="0">Highlight net class...</option>';
+    for (const netClass of scene.netClasses) {
+      if (!netClass.id) continue;
+      const option = document.createElement("option");
+      option.value = String(netClass.id);
+      option.textContent = netClass.name;
+      option.selected = netClass.id === state.activeNetClassId;
+      classSelect.append(option);
+    }
+    classSelect.addEventListener("change", () => {
+      state.activeNetClassId = Number(classSelect.value || 0);
+      state.activeNetId = 0;
+      state.selectedFeatureId = 0;
+      renderControls();
+    });
+    layersEl.append(controlField("Net class", classSelect));
+
+    if (!state.orthoLocked) {
       const cameraTools = document.createElement("div");
       cameraTools.className = "mode-toolbar camera-toolbar";
       for (const [tool, label] of [["orbit", "Orbit"], ["pan", "Pan"]]) {
@@ -781,7 +1035,7 @@ self.onmessage = async (event) => {
         toggleControl("Board substrate", state.showBoard, (value) => { state.showBoard = value; }),
         toggleControl("Components", state.showComponents, async (value) => {
           state.showComponents = value;
-          if (value) await loadOrbitScene();
+          if (value) await loadActiveScene();
         }),
         toggleControl("Unmapped copper", state.showUnmapped, (value) => { state.showUnmapped = value; }),
         toggleControl("Selected net only", state.isolateNet, (value) => { state.isolateNet = value; }, !state.activeNetId),
@@ -838,8 +1092,10 @@ self.onmessage = async (event) => {
   function updateDiagnostics() {
     const activeNet = netById(state.activeNetId);
     const rows = {
-      renderer: scene.manifest?.schema === "prism.semantic_scene_a4" ? "WebGPU A4" : "WebGPU A3",
-      mode: state.mode,
+      renderer: scene.isSemanticGltf
+        ? "WebGPU semantic GLB"
+        : scene.manifest?.schema === "prism.semantic_scene_a4" ? "WebGPU A4" : "WebGPU A3",
+      mode: state.orthoLocked ? "layer" : "orbit",
       layer: state.orthoLocked ? Array.from(state.visibleLayers).map(id => layerById(id).name).join(", ") : "stackup",
       chunks: scene.resident.size,
       drawCalls: scene.drawCalls,
@@ -849,6 +1105,8 @@ self.onmessage = async (event) => {
       shell: state.firstShellMs ? `${state.firstShellMs.toFixed(0)} ms` : "-",
       activeLayer: state.activeLayerMs ? `${state.activeLayerMs.toFixed(0)} ms` : "-",
       activeNet: activeNet?.name || "-",
+      activeClass: scene.netClasses[state.activeNetClassId]?.name || "-",
+      lastPick: state.lastPickId || "-",
       fps: state.fps.toFixed(1),
     };
     diagnosticsEl.innerHTML = Object.entries(rows).map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
@@ -869,6 +1127,7 @@ struct ChunkTransform { minimum: vec4f, scale: vec4f }
 @group(0) @binding(2) var<storage, read> layerColors: array<vec4f>;
 @group(0) @binding(3) var<storage, read> netColors: array<vec4f>;
 @group(0) @binding(4) var<storage, read> layerOffsets: array<f32>;
+@group(0) @binding(5) var<storage, read> netClassIds: array<u32>;
 @group(1) @binding(0) var<uniform> chunk: ChunkTransform;
 struct VertexIn {
   @location(0) position: vec4f,
@@ -937,11 +1196,15 @@ fn finishVertex(position: vec3f, normal: vec3f, featureId: u32) -> VertexOut {
 @fragment fn fs(input: VertexOut) -> @location(0) vec4f {
   let feature = features[input.featureId];
   let activeNet = uniforms.ids.x;
+  let activeClass = uniforms.visibility.x;
   let selectedFeature = uniforms.ids.y;
   let colorMode = uniforms.ids.z;
   let light = normalize(vec3f(-0.35, 0.8, 0.45));
   let shade = 0.62 + max(dot(abs(input.normal), light), 0.0) * 0.38;
-  if (activeNet != 0u && input.netId == activeNet) {
+  if (
+    (activeNet != 0u && input.netId == activeNet)
+    || (activeClass != 0u && input.netId != 0u && netClassIds[input.netId] == activeClass)
+  ) {
     let pulse = 0.5 + 0.5 * sin(uniforms.animation.x * 3.4);
     return vec4f(vec3f(0.08 + pulse * 0.12, 1.0, 0.16 + pulse * 0.16) * (0.88 + pulse * 0.25), 1.0);
   }
@@ -969,6 +1232,7 @@ struct PickOutput {
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
       ],
     });
     const chunkLayout = device.createBindGroupLayout({
@@ -1046,11 +1310,11 @@ struct PickOutput {
       pass.setPipeline(picking ? pickPipeline : mainPipeline);
       pass.setBindGroup(1, resident.bindGroup);
       pass.setVertexBuffer(0, resident.vertexBuffer);
-      pass.setIndexBuffer(resident.indexBuffer, "uint16");
+      pass.setIndexBuffer(resident.indexBuffer, resident.indexFormat || "uint16");
       pass.drawIndexed(resident.indexCount);
       draws += 1;
     }
-    if (state.mode === "orbit" && state.showComponents) {
+    if (!state.orthoLocked && state.showComponents) {
       for (const resident of scene.componentResident) {
         if (!resident) continue;
         pass.setPipeline(picking ? componentPickPipeline : componentPipeline);
@@ -1119,6 +1383,7 @@ struct PickOutput {
       pickPositionReadBuffer.mapAsync(GPUMapMode.READ),
     ]);
     const id = new DataView(pickReadBuffer.getMappedRange()).getUint32(0, true);
+    state.lastPickId = id;
     const positionView = new DataView(pickPositionReadBuffer.getMappedRange());
     const worldPosition = [
       positionView.getFloat32(0, true),
@@ -1185,6 +1450,7 @@ struct PickOutput {
     featureBuffer = createMappedBuffer(new Uint8Array(scene.featureGpuData.buffer), GPUBufferUsage.STORAGE);
     layerColorBuffer = createMappedBuffer(new Uint8Array(colorArray(scene.layers, [0.6, 0.6, 0.6, 1]).buffer), GPUBufferUsage.STORAGE);
     netColorBuffer = createMappedBuffer(new Uint8Array(colorArray(scene.nets, [0.8, 0.5, 0.2, 1]).buffer), GPUBufferUsage.STORAGE);
+    netClassBuffer = createMappedBuffer(new Uint8Array(scene.netClassIds.buffer), GPUBufferUsage.STORAGE);
     layerOffsetBuffer = createMappedBuffer(new Uint8Array(layerOffsets().buffer), GPUBufferUsage.STORAGE);
     const mainLayout = createPipelines();
     mainBindGroup = device.createBindGroup({
@@ -1195,6 +1461,7 @@ struct PickOutput {
         { binding: 2, resource: { buffer: layerColorBuffer } },
         { binding: 3, resource: { buffer: netColorBuffer } },
         { binding: 4, resource: { buffer: layerOffsetBuffer } },
+        { binding: 5, resource: { buffer: netClassBuffer } },
       ],
     });
     pickTexture = device.createTexture({ size: [1, 1], format: "r32uint", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });

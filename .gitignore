@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .cache/
+node_modules/
 
 # Reference repositories are cloned locally for inspection, not vendored here.
 references/*/

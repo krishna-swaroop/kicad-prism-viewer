@@ -251,62 +251,11 @@ def _declared_layers(pcb: Any) -> list[dict[str, Any]]:
 
 def _board_bbox(pcb: Any) -> list[float]:
     bbox: list[float] | None = None
-    for rect in getattr(pcb, "gr_rects", []) or []:
-        if getattr(rect, "layer", "") != "Edge.Cuts":
-            continue
-        rect_bbox = _bbox_from_points(
-            [
-                (rect.start_x, rect.start_y),
-                (rect.end_x, rect.start_y),
-                (rect.end_x, rect.end_y),
-                (rect.start_x, rect.end_y),
-            ]
-        )
-        bbox = _merge_bbox(bbox, rect_bbox)
-    for line in getattr(pcb, "gr_lines", []) or []:
-        if getattr(line, "layer", "") != "Edge.Cuts":
-            continue
-        bbox = _merge_bbox(
-            bbox,
-            _bbox_from_points([(line.start_x, line.start_y), (line.end_x, line.end_y)]),
-        )
-    for arc in getattr(pcb, "gr_arcs", []) or []:
-        if getattr(arc, "layer", "") != "Edge.Cuts":
-            continue
-        bbox = _merge_bbox(
-            bbox,
-            _bbox_from_points(
-                [
-                    (arc.start_x, arc.start_y),
-                    (arc.mid_x, arc.mid_y),
-                    (arc.end_x, arc.end_y),
-                ]
-            ),
-        )
-    for circle in getattr(pcb, "gr_circles", []) or []:
-        if getattr(circle, "layer", "") != "Edge.Cuts":
-            continue
-        radius = float(getattr(circle, "radius", 0.0) or 0.0)
-        bbox = _merge_bbox(
-            bbox,
-            [
-                round(float(circle.center_x) - radius, 6),
-                round(float(circle.center_y) - radius, 6),
-                round(float(circle.center_x) + radius, 6),
-                round(float(circle.center_y) + radius, 6),
-            ],
-        )
-    for poly in getattr(pcb, "gr_polys", []) or []:
-        if getattr(poly, "layer", "") != "Edge.Cuts":
-            continue
-        points = list(getattr(poly, "points", []) or [])
-        bbox = _merge_bbox(bbox, _bbox_from_points(points))
+    for item in pcb.top_level_outline_items(layer_name="Edge.Cuts"):
+        bbox = _merge_bbox(bbox, _bbox_list(item.get_bounds()))
     if bbox:
         return bbox
-    try:
-        board_bounds = _bbox_list(pcb.get_bounds())
-    except AttributeError:
-        board_bounds = None
+    board_bounds = _bbox_list(pcb.get_bounds())
     return board_bounds or [0.0, 0.0, 80.0, 50.0]
 
 

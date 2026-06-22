@@ -10,9 +10,9 @@ model plus GPU-friendly render buffers.
 ## Layout
 
 - `references/`: cloned Wavenumber repositories for local code/reference.
-- `pipeline/`: Python topology compiler, GPU scene bundle writer, and HTML
+- `pipeline/`: Python topology compiler, semantic glTF scene writer, and HTML
   exporter.
-- `viewer/`: dependency-free browser viewer source.
+- `viewer/`: WebGPU viewer and bundled standards-based glTF loader.
 - `samples/`: generated sample topology, scene, and standalone HTML.
 - `tests/`: Python contract/unit tests.
 - `docs/`: implementation notes and reference repository SHAs.
@@ -42,22 +42,32 @@ Build the USB-PD Trigger Board sample:
 bash scripts/build_usb_pd_sample.sh
 ```
 
+Install the JavaScript tooling and rebuild the embedded glTF loader after
+dependency changes:
+
+```bash
+npm install
+npm run build:viewer
+```
+
 ## Current Scope
 
 Implemented now:
 
 - `topology_model_a0` backed by `kicad_monkey`, including real board stackup.
 - semantic copper generation from `KiCadDesign.to_pcb_ir()` with saved-zone
-  validation and Geometer planar union/triangulation.
-- `semantic_scene_a4` with visual net features, authoritative source-object
-  indexes, 32-bit layer masks, quantized
-  16-byte vertices, 16-bit indices, tiled LOD chunks, and Zstandard compression.
-- progressive WebGPU loading with worker-based native/WASM decompression.
+  validation and analytic track, arc, pad, via, and zone contours.
+- tiled `prism.semantic_gltf_a0` GLBs using `EXT_mesh_features`,
+  `EXT_meshopt_compression`, and `KHR_mesh_quantization`.
+- `_FEATURE_ID_0` net ownership and `_FEATURE_ID_1` source-object ownership.
+- progressive WebGPU loading of only the active copper layer in Layer View.
 - click-to-net picking for tracks, zones, pads, and vias.
-- component geometry deduplication and GPU instancing.
+- net metadata inspection and GPU net-class highlighting.
 - independent outer and inner copper layer views.
 - orbit, pan, zoom, net isolation, and exploded-stackup 3D controls.
 
-KiCad GLB is now used only for the board context and component models. Copper
+KiCad GLB is used only for board context and component models. Copper
 ownership is assigned from PCB IR before tessellation; no aggregate or per-net
-copper GLB is generated. Build intermediates are cached under `.cache/geometry`.
+copper GLB is generated. Surface copper is the production render LOD at its
+real stackup height. Copper thickness remains metadata for later solid
+inspection and FEM meshing. Build inputs are cached under `samples/.cache/`.

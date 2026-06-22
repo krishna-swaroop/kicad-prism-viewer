@@ -11,7 +11,8 @@ from .exporter import export_viewer_html
 from .kicad_cli_export import export_project_geometry
 from .pcb_extract import extract_pcb_metadata
 from .scene import build_scene_bundle
-from .semantic_scene_a4 import build_semantic_scene_a4, extract_pad_holes
+from .semantic_gltf import build_semantic_gltf_scene
+from .semantic_scene_a4 import extract_pad_holes
 
 
 def _load_json(path: Path) -> dict:
@@ -136,22 +137,21 @@ def cmd_from_project(args: argparse.Namespace) -> None:
                 args.output,
                 strict_components=args.strict_components,
             )
-            semantic_geometry["semantic_scene"] = build_semantic_scene_a4(
+            semantic_geometry["semantic_scene"] = build_semantic_gltf_scene(
                 topology,
                 semantic_geometry,
                 pcb_ir,
                 args.output,
                 pad_holes=pad_holes,
             )
-            semantic_geometry["assets"]["scene_manifest"] = "scene/scene.manifest.json"
+            semantic_geometry["assets"]["scene_manifest"] = "scene-gltf/scene.manifest.json"
             (args.output / "semantic_scene.bin").unlink(missing_ok=True)
-            if not args.debug_assets:
-                shutil.rmtree(args.output / "geometry", ignore_errors=True)
+            shutil.rmtree(args.output / "scene", ignore_errors=True)
         except Exception as exc:
             print(f"error: semantic PCB geometry export failed for {project_file}: {exc}", file=sys.stderr)
             raise SystemExit(3)
         topology["design"].setdefault("assets", {})["semantic_geometry"] = "semantic_geometry.json"
-        topology["design"]["assets"]["geometry_mode"] = "semantic-pcb-ir-geometer"
+        topology["design"]["assets"]["geometry_mode"] = "semantic-gltf"
     _write_outputs(topology, args.output, semantic_geometry)
 
 

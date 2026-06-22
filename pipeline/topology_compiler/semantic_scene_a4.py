@@ -30,12 +30,15 @@ RING_RECORD = struct.Struct("<II")
 POINT_RECORD = struct.Struct("<2f")
 NM_TO_MM = 1e-6
 MM_TO_M = 1e-3
+COPPER_TILE_SIZE_MM = 20.0
 
 
 @dataclass
 class PlanarJob:
     net_name: str
     layer: str
+    tile: tuple[int, int] | None = None
+    clip_bounds: tuple[float, float, float, float] | None = None
     subjects: list[list[tuple[float, float]]] = field(default_factory=list)
     subtracts: list[list[tuple[float, float]]] = field(default_factory=list)
     strokes: dict[float, list[list[tuple[float, float]]]] = field(default_factory=lambda: defaultdict(list))
@@ -85,6 +88,8 @@ class SemanticSceneA4Builder(SemanticSceneA3Builder):
             str(layer.get("name") or ""): index for index, layer in enumerate(self.copper_layers)
         }
         self.board_thickness_mm = float(topology.get("board", {}).get("thickness_mm") or 0.0)
+        self.empty_zone_fills: list[dict[str, Any]] = []
+        self.tile_diagnostics: dict[str, Any] = {}
 
     def _set_board_y_range(self, primitives: list[Primitive]) -> None:
         _SemanticSceneBuilder._set_board_y_range(self, primitives)
@@ -134,30 +139,58 @@ class SemanticSceneA4Builder(SemanticSceneA3Builder):
         if not jobs:
             raise ValueError("PCB IR did not contain semantic copper geometry")
 
-        ordered_keys = sorted(jobs)
-        solved = _solve_planar_jobs([jobs[key] for key in ordered_keys])
-        triangulations = _triangulate_regions([region for regions in solved for region in regions])
-        triangle_offset = 0
-        for key, regions in zip(ordered_keys, solved):
-            job = jobs[key]
-            net_uid = self.net_uid_by_name.get(job.net_name, "")
-            if job.net_name and not net_uid:
-                raise ValueError(f"PCB IR net is absent from topology: {job.net_name!r}")
-            layer = self.physical_layer_by_name.get(job.layer)
-            if not layer:
-                raise ValueError(f"PCB IR copper layer is absent from topology stackup: {job.layer!r}")
-            y_bottom_mm, y_top_mm = self._layer_y_interval_mm(layer)
-            for region in regions:
-                indices = triangulations[triangle_offset]
-                triangle_offset += 1
-                primitive = _extrude_region(region, indices, y_bottom_mm, y_top_mm)
-                self._append_primitive(
-                    primitive,
-                    net_uid=net_uid,
-                    layer=job.layer,
-                    kind="track",
-                    label=job.net_name,
-                )
+        tiled_jobs = _tile_planar_jobs(
+            [jobs[key] for key in sorted(jobs)],
+            float(os.environ.get("PRISM_COPPER_TILE_SIZE_MM", COPPER_TILE_SIZE_MM)),
+        )
+        self.tile_diagnostics = {
+            "tile_size_mm": float(os.environ.get("PRISM_COPPER_TILE_SIZE_MM", COPPER_TILE_SIZE_MM)),
+            "job_count_before_tiling": len(jobs),
+            "job_count_after_tiling": len(tiled_jobs),
+            "tile_count": len({job.tile for job in tiled_jobs}),
+        }
+        jobs_by_tile: dict[tuple[int, int], list[PlanarJob]] = defaultdict(list)
+        for job in tiled_jobs:
+            if job.tile is None:
+                raise ValueError("Tiled planar job is missing its tile identity")
+            jobs_by_tile[job.tile].append(job)
+
+        for tile in sorted(jobs_by_tile):
+            tile_jobs = jobs_by_tile[tile]
+            clip_bounds = tile_jobs[0].clip_bounds
+            if clip_bounds is None:
+                raise ValueError(f"Tile {tile} is missing clip bounds")
+            solved = _solve_planar_jobs(
+                tile_jobs,
+                final_clip_rings=[_rectangle_ring(clip_bounds)],
+                allow_empty=True,
+            )
+            for job, regions in zip(tile_jobs, solved):
+                triangulations = _triangulate_regions(regions)
+                self._append_solved_job(job, regions, triangulations)
+
+    def _append_solved_job(
+        self,
+        job: PlanarJob,
+        regions: list[dict[str, Any]],
+        triangulations: list[list[int]],
+    ) -> None:
+        net_uid = self.net_uid_by_name.get(job.net_name, "")
+        if job.net_name and not net_uid:
+            raise ValueError(f"PCB IR net is absent from topology: {job.net_name!r}")
+        layer = self.physical_layer_by_name.get(job.layer)
+        if not layer:
+            raise ValueError(f"PCB IR copper layer is absent from topology stackup: {job.layer!r}")
+        y_bottom_mm, y_top_mm = self._layer_y_interval_mm(layer)
+        for region, indices in zip(regions, triangulations):
+            primitive = _extrude_region(region, indices, y_bottom_mm, y_top_mm)
+            self._append_primitive(
+                primitive,
+                net_uid=net_uid,
+                layer=job.layer,
+                kind="track",
+                label=job.net_name,
+            )
 
     def _job(
         self,
@@ -215,11 +248,19 @@ class SemanticSceneA4Builder(SemanticSceneA3Builder):
         fill_layers = [str(item) for item in record.get("fill_layers", []) or []]
         declared_layers = [str(item) for item in record.get("layers", []) or []]
         if not operations:
-            raise ValueError(
-                "Saved zone fill is missing for "
-                f"zone {record.get('uuid') or '<unknown>'} on {','.join(declared_layers) or '<unknown layer>'}. "
-                "Refill zones in KiCad and save the board before export."
+            if fill_layers:
+                raise ValueError(
+                    f"Zone {record.get('uuid') or '<unknown>'} declares {len(fill_layers)} "
+                    "fill-layer assignments but contains no saved polygons"
+                )
+            self.empty_zone_fills.append(
+                {
+                    "uuid": str(record.get("uuid") or ""),
+                    "layers": declared_layers,
+                    "net_name": str(record.get("net_name") or ""),
+                }
             )
+            return
         if fill_layers and len(fill_layers) != len(operations):
             raise ValueError(
                 f"Zone {record.get('uuid') or '<unknown>'} has {len(operations)} saved polygons "
@@ -420,6 +461,11 @@ class SemanticSceneA4Builder(SemanticSceneA3Builder):
                 "object_index": object_info,
                 "ownership": "pcb-ir-before-tessellation",
                 "geometer": {"planar_union": True, "triangulation": True},
+                "diagnostics": {
+                    **manifest.get("diagnostics", {}),
+                    "empty_zone_fills": self.empty_zone_fills,
+                    "copper_tiling": self.tile_diagnostics,
+                },
             }
         )
         manifest_path.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
@@ -468,8 +514,111 @@ def extract_pad_holes(pcb: Any) -> dict[str, dict[str, Any]]:
     return holes
 
 
-def _solve_planar_jobs(jobs: list[PlanarJob]) -> list[list[dict[str, Any]]]:
-    request = _encode_solve_request(jobs)
+def _tile_planar_jobs(jobs: list[PlanarJob], tile_size_mm: float) -> list[PlanarJob]:
+    if tile_size_mm <= 0:
+        raise ValueError("Copper tile size must be positive")
+    tiled: dict[tuple[str, str, int, int], PlanarJob] = {}
+
+    def target(job: PlanarJob, tile: tuple[int, int]) -> PlanarJob:
+        key = (job.net_name, job.layer, tile[0], tile[1])
+        existing = tiled.get(key)
+        if existing is None:
+            existing = PlanarJob(
+                job.net_name,
+                job.layer,
+                tile=tile,
+                clip_bounds=(
+                    tile[0] * tile_size_mm,
+                    tile[1] * tile_size_mm,
+                    (tile[0] + 1) * tile_size_mm,
+                    (tile[1] + 1) * tile_size_mm,
+                ),
+            )
+            existing.source_uids.update(job.source_uids)
+            tiled[key] = existing
+        return existing
+
+    for job in jobs:
+        for ring in job.subjects:
+            for tile in _tiles_for_bounds(_points_bounds(ring), tile_size_mm):
+                target(job, tile).subjects.append(ring)
+        for ring in job.subtracts:
+            for tile in _tiles_for_bounds(_points_bounds(ring), tile_size_mm):
+                target(job, tile).subtracts.append(ring)
+        for radius, paths in job.strokes.items():
+            for path in paths:
+                bounds = _expand_bounds(_points_bounds(path), radius)
+                for tile in _tiles_for_bounds(bounds, tile_size_mm):
+                    target(job, tile).strokes[radius].append(path)
+
+    return sorted(
+        (
+            job
+            for job in tiled.values()
+            if job.subjects or any(job.strokes.values())
+        ),
+        key=lambda job: (
+            job.tile or (0, 0),
+            job.layer,
+            job.net_name,
+        ),
+    )
+
+
+def _points_bounds(points: list[tuple[float, float]]) -> tuple[float, float, float, float]:
+    return (
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
+    )
+
+
+def _expand_bounds(
+    bounds: tuple[float, float, float, float],
+    margin: float,
+) -> tuple[float, float, float, float]:
+    return (
+        bounds[0] - margin,
+        bounds[1] - margin,
+        bounds[2] + margin,
+        bounds[3] + margin,
+    )
+
+
+def _tiles_for_bounds(
+    bounds: tuple[float, float, float, float],
+    tile_size_mm: float,
+) -> Iterable[tuple[int, int]]:
+    epsilon = 1e-9
+    min_x = math.floor(bounds[0] / tile_size_mm)
+    min_y = math.floor(bounds[1] / tile_size_mm)
+    max_x = math.floor((bounds[2] - epsilon) / tile_size_mm)
+    max_y = math.floor((bounds[3] - epsilon) / tile_size_mm)
+    for tile_y in range(min_y, max(min_y, max_y) + 1):
+        for tile_x in range(min_x, max(min_x, max_x) + 1):
+            yield tile_x, tile_y
+
+
+def _rectangle_ring(
+    bounds: tuple[float, float, float, float],
+) -> list[tuple[float, float]]:
+    min_x, min_y, max_x, max_y = bounds
+    return [
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+    ]
+
+
+def _solve_planar_jobs(
+    jobs: list[PlanarJob],
+    *,
+    final_clip_rings: list[list[tuple[float, float]]] | None = None,
+    allow_empty: bool = False,
+) -> list[list[dict[str, Any]]]:
+    request = _encode_solve_request(jobs, final_clip_rings=final_clip_rings or [])
     executable = _find_geometer()
     with tempfile.TemporaryDirectory() as tmp:
         request_path = Path(tmp) / "solve.request.bin"
@@ -482,7 +631,7 @@ def _solve_planar_jobs(jobs: list[PlanarJob]) -> list[list[dict[str, Any]]]:
         )
         if proc.returncode != 0:
             raise RuntimeError(f"Geometer planar solve failed: {proc.stderr or proc.stdout}")
-        return _decode_solve_response(response_path.read_bytes(), jobs)
+        return _decode_solve_response(response_path.read_bytes(), jobs, allow_empty=allow_empty)
 
 
 def _find_geometer() -> Path:
@@ -506,7 +655,12 @@ def _find_geometer() -> Path:
     raise FileNotFoundError("Geometer executable not found. Set GEOMETER or build references/geometer.")
 
 
-def _encode_solve_request(jobs: list[PlanarJob]) -> bytes:
+def _encode_solve_request(
+    jobs: list[PlanarJob],
+    *,
+    final_clip_rings: list[list[tuple[float, float]]] | None = None,
+) -> bytes:
+    final_clip_rings = final_clip_rings or []
     output = bytearray(
         struct.pack(
             "<8sIIII3dIIII",
@@ -519,13 +673,26 @@ def _encode_solve_request(jobs: list[PlanarJob]) -> bytes:
             2.0,
             0.005,
             0,
-            0,
+            len(final_clip_rings),
             0,
             0,
         )
     )
+    for ring in final_clip_rings:
+        _write_ring(output, ring)
     for job in jobs:
-        output.extend(struct.pack("<IdIIII", 0, 0.0, len(job.subjects), len(job.subtracts), len(job.strokes), 0))
+        flags = 1 << 2 if final_clip_rings else 0
+        output.extend(
+            struct.pack(
+                "<IdIIII",
+                flags,
+                0.0,
+                len(job.subjects),
+                len(job.subtracts),
+                len(job.strokes),
+                0,
+            )
+        )
         for ring in job.subjects:
             _write_ring(output, ring)
         for ring in job.subtracts:
@@ -537,7 +704,12 @@ def _encode_solve_request(jobs: list[PlanarJob]) -> bytes:
     return bytes(output)
 
 
-def _decode_solve_response(data: bytes, jobs: list[PlanarJob]) -> list[list[dict[str, Any]]]:
+def _decode_solve_response(
+    data: bytes,
+    jobs: list[PlanarJob],
+    *,
+    allow_empty: bool = False,
+) -> list[list[dict[str, Any]]]:
     view = memoryview(data)
     magic, version, job_count, *_ = struct.unpack_from("<8sIIIIII", view, 0)
     if magic != b"GMPBRS01" or version != 2 or job_count != len(jobs):
@@ -559,7 +731,7 @@ def _decode_solve_response(data: bytes, jobs: list[PlanarJob]) -> list[list[dict
                 ring, offset = _read_ring(view, offset)
                 holes.append(ring)
             regions.append({"outline": outline, "holes": holes})
-        if not regions and job.net_name and (job.subjects or job.strokes):
+        if not allow_empty and not regions and job.net_name and (job.subjects or job.strokes):
             raise ValueError(
                 f"Geometer produced no copper for net {job.net_name!r} on {job.layer}; "
                 f"sources={sorted(job.source_uids)[:8]}"
@@ -571,6 +743,33 @@ def _decode_solve_response(data: bytes, jobs: list[PlanarJob]) -> list[list[dict
 def _triangulate_regions(regions: list[dict[str, Any]]) -> list[list[int]]:
     if not regions:
         return []
+    batch_size = max(1, int(os.environ.get("PRISM_GEOMETER_TRIANGULATION_BATCH_SIZE", "256")))
+    point_budget = max(
+        1,
+        int(os.environ.get("PRISM_GEOMETER_TRIANGULATION_POINT_BUDGET", "200000")),
+    )
+    result: list[list[int]] = []
+    batch: list[dict[str, Any]] = []
+    batch_start = 0
+    batch_points = 0
+    for index, region in enumerate(regions):
+        region_points = len(region["outline"]) + sum(len(hole) for hole in region["holes"])
+        if batch and (len(batch) >= batch_size or batch_points + region_points > point_budget):
+            result.extend(_triangulate_region_batch(batch, batch_start))
+            batch = []
+            batch_start = index
+            batch_points = 0
+        batch.append(region)
+        batch_points += region_points
+    if batch:
+        result.extend(_triangulate_region_batch(batch, batch_start))
+    return result
+
+
+def _triangulate_region_batch(
+    regions: list[dict[str, Any]],
+    region_offset: int,
+) -> list[list[int]]:
     request = bytearray(struct.pack("<8sIIII", b"GMTRRQ01", 1, len(regions), 6, 0))
     for region in regions:
         request.extend(struct.pack("<II", len(region["outline"]), len(region["holes"])))
@@ -587,14 +786,67 @@ def _triangulate_regions(regions: list[dict[str, Any]]) -> list[list[int]]:
             request_path = Path(tmp) / "triangulate.request.bin"
             response_path = Path(tmp) / "triangulate.response.bin"
             request_path.write_bytes(request)
-            proc = subprocess.run(
-                [str(executable), "planar-triangulate", str(request_path), str(response_path)],
-                capture_output=True,
-                text=True,
+            timeout_seconds = max(
+                1.0,
+                float(os.environ.get("PRISM_GEOMETER_TRIANGULATION_TIMEOUT_SECONDS", "30")),
             )
+            try:
+                proc = subprocess.run(
+                    [str(executable), "planar-triangulate", str(request_path), str(response_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                if len(regions) > 1:
+                    midpoint = len(regions) // 2
+                    return [
+                        *_triangulate_region_batch(regions[:midpoint], region_offset),
+                        *_triangulate_region_batch(
+                            regions[midpoint:],
+                            region_offset + midpoint,
+                        ),
+                    ]
+                point_count = len(regions[0]["outline"]) + sum(
+                    len(hole) for hole in regions[0]["holes"]
+                )
+                raise RuntimeError(
+                    "Geometer native triangulation timed out "
+                    f"for region {region_offset} ({point_count} points, "
+                    f"{len(regions[0]['holes'])} holes) after {timeout_seconds:g}s"
+                ) from None
             if proc.returncode != 0:
-                raise RuntimeError(f"Geometer native triangulation failed: {proc.stderr or proc.stdout}")
+                detail = (proc.stderr or proc.stdout or "").strip()
+                if "Unknown command: planar-triangulate" in detail:
+                    return _triangulate_region_batch_node(regions, region_offset, request)
+                if len(regions) > 1:
+                    midpoint = len(regions) // 2
+                    return [
+                        *_triangulate_region_batch(regions[:midpoint], region_offset),
+                        *_triangulate_region_batch(
+                            regions[midpoint:],
+                            region_offset + midpoint,
+                        ),
+                    ]
+                end = region_offset + len(regions) - 1
+                detail = detail or "no diagnostic output"
+                point_count = len(regions[0]["outline"]) + sum(
+                    len(hole) for hole in regions[0]["holes"]
+                )
+                raise RuntimeError(
+                    "Geometer native triangulation failed "
+                    f"for region batch {region_offset}-{end} ({point_count} points) "
+                    f"with exit code {proc.returncode}: {detail}"
+                )
             return _decode_triangulation(response_path.read_bytes(), len(regions))
+    return _triangulate_region_batch_node(regions, region_offset, request)
+
+
+def _triangulate_region_batch_node(
+    regions: list[dict[str, Any]],
+    region_offset: int,
+    request: bytes | bytearray,
+) -> list[list[int]]:
     repo_root = Path(__file__).resolve().parents[2]
     helper = repo_root / "scripts" / "geometer_planar_triangulate.js"
     geometer_root = repo_root / "references" / "geometer"
@@ -608,7 +860,12 @@ def _triangulate_regions(regions: list[dict[str, Any]]) -> list[list[int]]:
             text=True,
         )
         if proc.returncode != 0:
-            raise RuntimeError(f"Geometer triangulation failed: {proc.stderr or proc.stdout}")
+            end = region_offset + len(regions) - 1
+            detail = (proc.stderr or proc.stdout or "no diagnostic output").strip()
+            raise RuntimeError(
+                "Geometer triangulation failed "
+                f"for region batch {region_offset}-{end} with exit code {proc.returncode}: {detail}"
+            )
         return _decode_triangulation(response_path.read_bytes(), len(regions))
 
 

@@ -22,6 +22,7 @@ from pipeline.topology_compiler.semantic_scene_a3 import (
     SemanticSceneA3Builder,
 )
 from pipeline.topology_compiler.semantic_scene_a4 import OBJECT_HEADER, SemanticSceneA4Builder
+from pipeline.topology_compiler.semantic_gltf import SemanticGltfBuilder
 
 
 class TopologyCompilerTests(unittest.TestCase):
@@ -309,25 +310,45 @@ class TopologyCompilerTests(unittest.TestCase):
         self.assertEqual(manifest["object_index"]["count"], 1)
         self.assertIn("1", manifest["net_to_chunks"])
 
-    def test_a4_requires_saved_zone_fill(self) -> None:
+    def test_a4_records_authoritative_empty_zone_fill(self) -> None:
         topology = compile_topology(self.sample_design())
         builder = SemanticSceneA4Builder(topology)
-        with self.assertRaisesRegex(ValueError, "Saved zone fill is missing.*zone-missing.*F.Cu"):
-            builder.add_pcb_ir(
-                {
-                    "records": [
-                        {
-                            "uuid": "zone-missing",
-                            "kind": "zone_fill",
-                            "object_id": "zone",
-                            "layers": ["F.Cu"],
-                            "fill_layers": ["F.Cu"],
-                            "net_name": "VBUS",
-                            "operations": [],
-                        }
-                    ]
-                }
-            )
+        builder.add_pcb_ir(
+            {
+                "records": [
+                    {
+                        "uuid": "zone-empty",
+                        "kind": "zone_fill",
+                        "object_id": "zone",
+                        "layers": ["F.Cu"],
+                        "fill_layers": [],
+                        "net_name": "VBUS",
+                        "operations": [],
+                    },
+                    {
+                        "uuid": "track",
+                        "kind": "segment",
+                        "object_id": "segment",
+                        "layer": "F.Cu",
+                        "net_name": "VBUS",
+                        "operations": [
+                            {
+                                "kind": "ThickSegment",
+                                "start_x": 0,
+                                "start_y": 0,
+                                "end_x": 1_000_000,
+                                "end_y": 0,
+                                "width_nm": 100_000,
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+        self.assertEqual(
+            builder.empty_zone_fills,
+            [{"uuid": "zone-empty", "layers": ["F.Cu"], "net_name": "VBUS"}],
+        )
 
     def test_a4_pairs_each_saved_zone_polygon_with_its_fill_layer(self) -> None:
         topology = compile_topology(self.sample_design())
@@ -358,8 +379,39 @@ class TopologyCompilerTests(unittest.TestCase):
         )
         self.assertEqual(len(builder.object_shapes), 2)
         self.assertEqual({item.layer for item in builder.object_shapes}, {"F.Cu", "B.Cu"})
-        self.assertEqual(builder.physical_layer_by_name["F.Cu"]["z_mm"], 0.84)
-        self.assertEqual(builder.physical_layer_by_name["B.Cu"]["z_mm"], -0.84)
+
+    def test_semantic_gltf_uses_id_indirection_and_net_metrics(self) -> None:
+        topology = compile_topology(self.sample_design())
+        builder = SemanticGltfBuilder(topology)
+        builder.add_pcb_ir(
+            {
+                "records": [
+                    {
+                        "uuid": "track-1",
+                        "kind": "segment",
+                        "layer": "F.Cu",
+                        "net_name": "VBUS",
+                        "operations": [
+                            {
+                                "kind": "ThickSegment",
+                                "start_x": 0,
+                                "start_y": 0,
+                                "end_x": 10_000_000,
+                                "end_y": 0,
+                                "width_nm": 500_000,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = builder.write_input(Path(tmp) / "input.json")
+        self.assertEqual(len(payload["objects"]), 1)
+        self.assertEqual(payload["objects"][0]["netId"], 1)
+        self.assertEqual(payload["objects"][0]["objectFeatureId"], 1)
+        self.assertEqual(payload["nets"][1]["metrics"]["traceLengthMm"], 10.0)
+        self.assertEqual(payload["nets"][1]["metrics"]["layers"], ["F.Cu"])
 
 
 def _triangle_glb() -> bytes:

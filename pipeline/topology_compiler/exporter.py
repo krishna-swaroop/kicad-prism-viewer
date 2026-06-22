@@ -15,6 +15,7 @@ VIEWER_ROOT = ROOT / "viewer"
 def _read_viewer_sources() -> dict[str, str]:
     return {
         "styles": (VIEWER_ROOT / "styles.css").read_text(encoding="utf-8"),
+        "gltf_loader": (VIEWER_ROOT / "semantic-gltf-loader.js").read_text(encoding="utf-8"),
         "app": (VIEWER_ROOT / "app.js").read_text(encoding="utf-8"),
     }
 
@@ -47,6 +48,7 @@ def export_viewer_html(
     html = template.safe_substitute(
         title=title,
         styles=sources["styles"],
+        gltf_loader=sources["gltf_loader"],
         app=sources["app"],
         topology_json=json.dumps(embedded_topology, separators=(",", ":")),
         scene_base64=base64.b64encode(scene_bytes).decode("ascii"),

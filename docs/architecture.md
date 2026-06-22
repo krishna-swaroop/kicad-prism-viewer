@@ -2,42 +2,82 @@
 
 ## Runtime Shape
 
-The visualiser is intentionally driven by `topology_model_a0`, not by a Prism
-viewer API. The compiler converts KiCad-derived design data into a neutral
-graph of components, nets, terminals, physical objects, schematic pages, and
-lookup indexes. The PCB renderer consumes `prism.semantic_scene_a4`:
+The visualiser is driven by `topology_model_a0`, not by a Prism viewer API.
+The PCB renderer consumes `prism.semantic_gltf_a0`:
 
-- `visual_features.bin` maps fused render copper to exact net/layer ownership.
-- `object_index.bin` retains source UUID geometry for click identity.
-- compressed chunks contain shared quantized 3D solids.
-- `net_to_chunks` supports progressive selected-net loading.
+- tiled GLBs carry `_FEATURE_ID_0` for net ownership;
+- `_FEATURE_ID_1` identifies the authoritative KiCad source object;
+- `EXT_mesh_features` declares both feature domains;
+- `EXT_meshopt_compression` and `KHR_mesh_quantization` reduce transfer size;
+- `scene.manifest.json` stores nets, net classes, metrics, stackup, source
+  feature records, tile bounds, and `netToTiles`.
 
-## Why SVG Is Not The Main Runtime
-
-Enriched SVG is useful because it carries source ids, net/component metadata,
-view metadata, and high-fidelity drawing primitives. Large interactive designs
-should not depend on a large SVG DOM for hit testing or highlighting. The v0
-compiler extracts those semantic links into topology indexes; later geometry
-passes should convert SVG paths into vector/tile buffers and spatial indexes.
+Render triangles carry compact IDs only. Net names, classes, lengths, source
+UUIDs, and analysis metadata are stored once in lookup tables.
 
 ## Semantic Copper Pipeline
 
 `kicad_monkey` is the semantic authority. `KiCadDesign.to_pcb_ir()` supplies
-tracks, arcs, pads, vias, layers, nets, UUIDs, and saved zone fills. Copper
-records are grouped by `(net, layer)` before geometry processing. Geometer
-expands strokes, unions same-net copper, preserves holes, and triangulates the
-result. The compiler then extrudes each region at its real stackup position.
+tracks, arcs, pads, vias, layers, nets, UUIDs, net classes, and saved zone
+fills. Maintained polygon and triangulation libraries clip these authoritative
+contours into spatial tiles. Ownership is attached before tessellation.
 
-Click-to-net reads the immutable net ID carried by the picked visual feature.
-Click-to-object reconstructs the hit point and queries `object_index.bin` using
-the priority `pad > via > track/arc > zone`. It does not infer ownership from
-overlapping aggregate GLB meshes.
+Click-to-net reads `_FEATURE_ID_1`, resolves the source feature record, and
+then resolves its immutable net ID. No aggregate-mesh overlap heuristic is
+used.
 
-Layer View and 3D View render the same solids. Layer View changes only the
-orthographic camera and visibility mask.
+Layer View and 3D View render the same copper surfaces at real stackup heights.
+Layer View changes only the orthographic camera and visibility mask. Copper
+thickness remains metadata, allowing a solid inspection LOD or solver mesh to
+be generated without changing semantic ownership.
 
-## USB-PD Trigger Board
+KiCad GLB remains the source for board context and component models. STEP and
+Geometer remain suitable build-time paths for B-rep validation, component
+conversion, and MCAD interchange, but do not own PCB electrical semantics.
 
-`scripts/build_usb_pd_sample.sh` compiles the local USB-PD Trigger Board
-through `kicad_monkey`, Geometer, and the A4 scene packer. KiCad GLB contributes
-the board body, soldermask, silkscreen, and component models only.
+## Analysis Extension Contract
+
+The stable join keys are:
+
+- `netId` for electrical grouping and net-class operations;
+- `objectFeatureId` for KiCad tracks, arcs, zones, pads, and vias;
+- `geometryRevision` for detecting stale result files.
+
+Inspector UI reads net details from the manifest. Highlighting a net class
+uploads only an active class ID; the shader resolves membership through a
+compact `netId -> netClassId` table.
+
+An FEM workflow should generate a solver-quality surface or volume mesh from
+the authoritative PCB contours and stackup thicknesses. Solver cells retain
+`objectFeatureId` and `netId`, either directly or through a mapping table.
+Results can then be loaded as GPU buffers and rendered as scalar color maps,
+vectors, contours, or deformed overlays. The visual render mesh is not assumed
+to be a valid FEM volume mesh.
+
+Planned result sidecar:
+
+```json
+{
+  "schema": "prism.analysis_result_a0",
+  "geometryRevision": "<sha256>",
+  "analysisType": "dc_ir_drop",
+  "domain": {"netIds": [3], "objectFeatureIds": [18, 24]},
+  "mesh": {"path": "analysis/ir-drop.glb", "featureAttribute": "_FEATURE_ID_1"},
+  "fields": [
+    {"name": "voltage", "association": "vertex", "units": "V", "path": "analysis/voltage.bin"},
+    {"name": "currentDensity", "association": "cell", "units": "A/mm2", "path": "analysis/j.bin"}
+  ]
+}
+```
+
+## SVG Scope
+
+Enriched SVG remains useful for schematic fidelity and source mappings. Large
+interactive PCB designs do not depend on an SVG DOM for hit testing or
+highlighting.
+
+## Validation Fixtures
+
+`scripts/build_usb_pd_sample.sh` builds the USB-PD Trigger Board. JTYU-OBC is
+the large-board stress fixture. Its current semantic copper bundle contains all
+12 copper layers and remains independent of per-net GLB exports.
