@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>$title</title>
+    <style>
+$styles
+    </style>
+  </head>
+  <body>
+    <main id="app">
+      <section class="viewport-shell">
+        <canvas id="viewport"></canvas>
+        <div id="fallback" hidden></div>
+      </section>
+      <aside class="panel">
+        <header>
+          <p class="eyebrow">Topology Model A0</p>
+          <h1>$title</h1>
+          <p id="status">Booting renderer</p>
+        </header>
+        <section>
+          <h2>Layers</h2>
+          <div id="layers"></div>
+        </section>
+        <section>
+          <h2>Selection</h2>
+          <pre id="selection">No object selected</pre>
+        </section>
+        <section>
+          <h2>Diagnostics</h2>
+          <dl id="diagnostics"></dl>
+        </section>
+      </aside>
+    </main>
+    <script>
+      window.__TOPOLOGY__ = $topology_json;
+      window.__SCENE_BASE64__ = "$scene_base64";
+      window.__SEMANTIC_GEOMETRY__ = $semantic_geometry_json;
+    </script>
+    <script>
+$app
+    </script>
+  </body>
+</html>
