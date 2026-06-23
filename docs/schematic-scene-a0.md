@@ -58,6 +58,9 @@ compatibility shape of the future binary feature table plus string table:
 - `features`: dense records with `id`, `stableKey`, `pageId`, `sheetInstancePath`,
   `kind`, source IDs, optional `netUid`/`netName`, optional component reference,
   and bounds.
+- Rendered primitive sub-features are also present in the same table. They add
+  `parentFeatureId`, `primitiveKind` and `subFeatureIndex`, and inherit net,
+  component and source metadata from the parent source record.
 - `pages`: page-to-feature ID lists.
 - `byStableKey`: exact stable-key lookup.
 
@@ -73,9 +76,9 @@ Each chunk is a per-page, per-LOD payload:
 - `lod2`: electrical review primitives extracted from schematic instance IR.
 
 The current `lod2` chunk stores portable vector primitives (`line`, `polyline`,
-`circle`, `arc`, `text`, `unknown`) with their `featureId`. It is a compiler
-contract slice; the next renderer milestone consumes it with native WebGPU
-stroke, marker, text and picking pipelines.
+`circle`, `arc`, `text`, `unknown`) with a primitive-level `featureId`. These
+feature IDs resolve to primitive sub-feature records, which point back to their
+source record through `parentFeatureId`.
 
 Unsupported operation types are listed in `unsupported` arrays in the chunk and
 manifest. They are reported explicitly rather than silently dropped.
@@ -102,4 +105,5 @@ Milestone 3:
 - Add native L2 vector pipelines for wires, pins, junctions, labels and GPU
   integer picking.
 - Replace bounding-box feature selection with exact feature ID picking.
-
+- Preserve source-record identity through `parentFeatureId` so exact primitive
+  picking can still cross-probe to PCB/component/topology records.

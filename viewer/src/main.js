@@ -593,7 +593,9 @@ function selectSchematicPage(pageId, shouldFrame) {
   const page = schematicScene.byId.get(pageId);
   if (!page || !schematicRenderer) return;
   state.selectedPageId = page.id;
+  state.selectedSchematicFeature = null;
   schematicRenderer.selectedPageId = page.id;
+  schematicRenderer.selectedFeatureId = 0;
   selectionEl.textContent = JSON.stringify(page, null, 2);
   if (shouldFrame) schematicRenderer.framePage(page);
   layersEl.querySelectorAll("[data-page]").forEach((button) => {
@@ -642,6 +644,7 @@ function selectSchematicNet(netId, shouldFrame) {
   if (!net || !schematicRenderer) return;
   state.activeNetId = netId;
   state.selectedFeatureId = 0;
+  schematicRenderer.selectedFeatureId = 0;
   schematicScene.activeNetUid = net.uid;
   schematicRenderer.activeNetUid = net.uid;
   selectionEl.textContent = JSON.stringify(net, null, 2);
@@ -655,7 +658,10 @@ function clearSchematicSelection() {
   state.selectedFeatureId = 0;
   state.selectedSchematicFeature = null;
   schematicScene.activeNetUid = "";
-  if (schematicRenderer) schematicRenderer.activeNetUid = "";
+  if (schematicRenderer) {
+    schematicRenderer.activeNetUid = "";
+    schematicRenderer.selectedFeatureId = 0;
+  }
   selectionEl.textContent = "No object selected";
   updateSelectionCard();
 }
@@ -670,12 +676,15 @@ function selectSchematicFeature(hit) {
   const { page, feature } = hit;
   if (!feature) {
     state.selectedSchematicFeature = null;
+    schematicRenderer.selectedFeatureId = 0;
     selectSchematicPage(page.id, false);
     updateSelectionCard();
     return;
   }
+  const featureId = Number(feature.id || 0);
   state.selectedPageId = page.id;
   schematicRenderer.selectedPageId = page.id;
+  schematicRenderer.selectedFeatureId = featureId;
   state.selectedSchematicFeature = { ...feature, pageId: page.id };
   state.selectionAnchor = null;
 
@@ -684,19 +693,22 @@ function selectSchematicFeature(hit) {
     if (net) {
       selectSchematicNet(Number(net.id), false);
       state.selectedSchematicFeature = { ...feature, pageId: page.id };
+      schematicRenderer.selectedFeatureId = featureId;
       return;
     }
   }
   if (feature.reference) {
     const component = scene.componentFeatures.get(feature.reference);
     if (component) {
-      state.selectedSchematicFeature = null;
       selectFeature(Number(component.featureId), false);
+      state.selectedSchematicFeature = { ...feature, pageId: page.id };
+      schematicRenderer.selectedFeatureId = featureId;
       return;
     }
   }
   state.activeNetId = 0;
   state.selectedFeatureId = 0;
+  schematicRenderer.activeNetUid = "";
   selectionEl.textContent = JSON.stringify({ page: page.name, ...feature }, null, 2);
   updateSelectionCard();
 }

@@ -144,39 +144,55 @@ def _page_chunks(
     page: dict[str, Any],
     records: list[Any],
     features: list[dict[str, Any]],
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, str]]]:
+    next_feature_id: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, str]], list[dict[str, Any]], int]:
     feature_by_source = {feature["sourceId"]: feature for feature in features}
     unsupported: list[dict[str, str]] = []
     simplified_bounds = []
     primitives = []
+    primitive_features: list[dict[str, Any]] = []
 
     for record_index, record in enumerate(records, start=1):
         source_id = _record_source_id(record, record_index)
-        feature = feature_by_source.get(source_id)
-        if not feature:
+        parent_feature = feature_by_source.get(source_id)
+        if not parent_feature:
             continue
-        bounds = feature.get("boundsMm")
+        bounds = parent_feature.get("boundsMm")
         if bounds:
             simplified_bounds.append(
                 {
-                    "featureId": feature["id"],
-                    "kind": feature["kind"],
+                    "featureId": parent_feature["id"],
+                    "kind": parent_feature["kind"],
                     "boundsMm": bounds,
-                    "netUid": feature.get("netUid", ""),
+                    "netUid": parent_feature.get("netUid", ""),
                 }
             )
         for op_index, operation in enumerate(getattr(record, "operations", []) or [], start=1):
-            primitive, unsupported_kind = _operation_to_primitive(operation, feature["id"])
+            primitive_feature_id = next_feature_id
+            primitive, unsupported_kind = _operation_to_primitive(operation, primitive_feature_id)
             if primitive:
-                primitive["subFeatureKey"] = stable_feature_key(
+                sub_feature_key = stable_feature_key(
                     page["sheetInstancePath"],
                     source_id,
                     op_index,
                 )
+                primitive["subFeatureKey"] = sub_feature_key
                 bounds_mm = _operation_bounds(operation)
                 if bounds_mm:
                     primitive["boundsMm"] = bounds_mm
                 primitives.append(primitive)
+                primitive_feature = {
+                    **parent_feature,
+                    "id": primitive_feature_id,
+                    "stableKey": sub_feature_key,
+                    "parentFeatureId": parent_feature["id"],
+                    "primitiveKind": primitive["kind"],
+                    "subFeatureIndex": op_index,
+                }
+                if bounds_mm:
+                    primitive_feature["boundsMm"] = bounds_mm
+                primitive_features.append(primitive_feature)
+                next_feature_id += 1
             elif unsupported_kind:
                 unsupported.append(
                     {
@@ -209,7 +225,7 @@ def _page_chunks(
         "primitives": primitives,
         "unsupported": unsupported,
     }
-    return lod0, lod1, lod2, unsupported
+    return lod0, lod1, lod2, unsupported, primitive_features, next_feature_id
 
 
 def build_schematic_scene(
@@ -351,7 +367,18 @@ def build_schematic_scene(
         page_chunk_dir = chunk_dir / page["id"]
         page_chunk_dir.mkdir(parents=True, exist_ok=True)
         page_features = [features_by_id[feature_id] for feature_id in page["featureIds"]]
-        lod0, lod1, lod2, unsupported = _page_chunks(page, page_records[page["id"]], page_features)
+        lod0, lod1, lod2, unsupported, primitive_features, next_feature_id = _page_chunks(
+            page,
+            page_records[page["id"]],
+            page_features,
+            next_feature_id,
+        )
+        for feature in primitive_features:
+            features.append(feature)
+            features_by_id[feature["id"]] = feature
+            features_by_page[page["id"]].append(feature["id"])
+        page["featureIds"] = features_by_page[page["id"]]
+        page["featureCount"] = len(page["featureIds"])
         unsupported_operations.extend(
             {"pageId": page["id"], **item}
             for item in unsupported

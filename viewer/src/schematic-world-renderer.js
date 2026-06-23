@@ -233,7 +233,7 @@ export class SchematicWorldRenderer {
           },
         }],
       },
-      primitive: { topology: "triangle-list" },
+      primitive: { topology: "line-list" },
     });
     this.edgeBindGroup = device.createBindGroup({
       layout: this.edgeLayout,
@@ -258,7 +258,7 @@ export class SchematicWorldRenderer {
           },
         }],
       },
-      primitive: { topology: "triangle-list" },
+      primitive: { topology: "line-list" },
     });
     this.highlightBufferSize = 4 * 1024 * 1024;
     this.highlightBuffer = device.createBuffer({
@@ -290,7 +290,7 @@ export class SchematicWorldRenderer {
           },
         }],
       },
-      primitive: { topology: "line-list" },
+      primitive: { topology: "triangle-list" },
     });
     this.vectorBuffer = device.createBuffer({
       size: MAX_VECTOR_FLOATS * 4,
@@ -311,7 +311,7 @@ export class SchematicWorldRenderer {
         }],
       },
       fragment: { module: pickModule, entryPoint: "fs", targets: [{ format: "r32uint" }] },
-      primitive: { topology: "line-list" },
+      primitive: { topology: "triangle-list" },
     });
     this.pickVertexBuffer = device.createBuffer({
       size: MAX_PICK_VERTICES * 12,
@@ -331,6 +331,7 @@ export class SchematicWorldRenderer {
     this.pageResources = new Map();
     this.loading = new Map();
     this.selectedPageId = "";
+    this.selectedFeatureId = 0;
     this.activeNetUid = "";
     this.showHierarchy = true;
     this.downloadedBytes = 0;
@@ -526,13 +527,16 @@ export class SchematicWorldRenderer {
       for (const segment of chunk.segments) {
         const feature = this.featuresById.get(segment.featureId);
         const isSelectedNet = this.activeNetUid && feature?.netUid === this.activeNetUid;
-        if (this.activeNetUid && !isSelectedNet && isElectricalFeature(feature)) continue;
-        const color = isSelectedNet
+        const isSelectedFeature = this.selectedFeatureId === segment.featureId;
+        if (this.activeNetUid && !isSelectedNet && !isSelectedFeature && isElectricalFeature(feature)) continue;
+        const color = isSelectedFeature
+          ? [0.24, 0.58, 1.0, 1.0]
+          : isSelectedNet
           ? [0.06, 1.0, 0.24, 1.0]
           : vectorColor(feature, segment.kind);
         const a = this.sourceToWorld(page, segment.a);
         const b = this.sourceToWorld(page, segment.b);
-        const width = this.segmentWorldWidth(page, segment, feature, isSelectedNet);
+        const width = this.segmentWorldWidth(page, segment, feature, isSelectedNet || isSelectedFeature);
         appendStrokeQuad(floats, a, b, width, color);
         selectedFeatureIds.add(segment.featureId);
         if (floats.length >= MAX_VECTOR_FLOATS - 36) break;
@@ -924,6 +928,8 @@ function primitiveSegments(primitives) {
     } else if (Number.isFinite(primitive.cxMm) && Number.isFinite(primitive.cyMm)) {
       const radius = primitive.radiusMm || primitive.diameterMm / 2 || 0.4;
       appendCircle(segments, featureId, primitive.kind, [primitive.cxMm, primitive.cyMm], radius, widthMm);
+    } else if (primitive.kind === "text" && Number.isFinite(primitive.xMm) && Number.isFinite(primitive.yMm)) {
+      appendTextSegments(segments, primitive, featureId);
     } else if (
       Number.isFinite(primitive.start_xMm)
       && Number.isFinite(primitive.start_yMm)
@@ -960,6 +966,113 @@ function appendCircle(segments, featureId, kind, center, radius, widthMm) {
   }
 }
 
+const GLYPH_SEGMENTS = {
+  A: ["AB", "BC", "CD", "EF", "GH", "FG"],
+  B: ["AE", "AB", "BC", "CD", "EF", "GH", "FG", "ED"],
+  C: ["AB", "AE", "ED"],
+  D: ["AE", "AB", "BC", "CD", "DE"],
+  E: ["AB", "AE", "FG", "ED"],
+  F: ["AB", "AE", "FG"],
+  G: ["AB", "AE", "ED", "DC", "CG"],
+  H: ["AE", "BC", "FG"],
+  I: ["AB", "ED", "IJ"],
+  J: ["AB", "BC", "CD", "DE"],
+  K: ["AE", "FI", "FJ"],
+  L: ["AE", "ED"],
+  M: ["AE", "AH", "HB", "BC"],
+  N: ["AE", "AC", "BC"],
+  O: ["AB", "BC", "CD", "DE", "EA"],
+  P: ["AE", "AB", "BC", "CG", "GF"],
+  Q: ["AB", "BC", "CD", "DE", "EA", "JD"],
+  R: ["AE", "AB", "BC", "CG", "GF", "FD"],
+  S: ["AB", "AE", "FG", "CD", "DE"],
+  T: ["AB", "IJ"],
+  U: ["AE", "ED", "DC", "CB"],
+  V: ["AE", "EJ", "JB"],
+  W: ["AE", "EJ", "JD", "DC", "CB"],
+  X: ["AC", "EB"],
+  Y: ["AH", "BH", "HJ"],
+  Z: ["AB", "BE", "ED"],
+  0: ["AB", "BC", "CD", "DE", "EA"],
+  1: ["HB", "BC", "CD"],
+  2: ["AB", "BC", "CG", "GF", "FE", "ED"],
+  3: ["AB", "BC", "CG", "GF", "CD", "DE"],
+  4: ["AE", "FG", "BC"],
+  5: ["AB", "AE", "FG", "GC", "CD", "DE"],
+  6: ["AB", "AE", "ED", "DC", "CG", "GF"],
+  7: ["AB", "BC"],
+  8: ["AB", "BC", "CD", "DE", "EA", "FG"],
+  9: ["AB", "BC", "CD", "DE", "FG", "AE"],
+  "-": ["FG"],
+  "_": ["ED"],
+  ".": ["KM"],
+  ":": ["HL", "MJ"],
+  "/": ["BE"],
+  "\\": ["AC"],
+  "+": ["FG", "IJ"],
+  "(": ["BH", "HJ", "JD"],
+  ")": ["AH", "HJ", "JC"],
+  "[": ["AB", "AE", "ED"],
+  "]": ["AB", "BC", "CD"],
+};
+
+const GLYPH_POINTS = {
+  A: [0, 0],
+  B: [1, 0],
+  C: [1, 0.52],
+  D: [1, 1],
+  E: [0, 1],
+  F: [0, 0.52],
+  G: [1, 0.52],
+  H: [0.5, 0.18],
+  I: [0.5, 0],
+  J: [0.5, 1],
+  K: [0.55, 0.86],
+  L: [0.5, 0.32],
+  M: [0.5, 0.68],
+};
+
+function appendTextSegments(segments, primitive, featureId) {
+  const text = String(primitive.text || "").slice(0, 160);
+  if (!text.trim()) return;
+  const bounds = primitive.boundsMm;
+  const nominalHeight = Math.max(0.8, primitive.size_yMm || primitive.size_xMm || 1.27);
+  const height = bounds
+    ? Math.max(0.45, Math.min(nominalHeight * 1.6, bounds[3] - bounds[1] || nominalHeight))
+    : nominalHeight;
+  const glyphWidth = Math.max(0.38, height * 0.56);
+  const advance = glyphWidth * 0.82;
+  const originX = bounds ? bounds[0] : primitive.xMm;
+  const originY = bounds ? bounds[1] : primitive.yMm - height * 0.5;
+  const angle = (Number.isFinite(primitive.angle) ? primitive.angle : 0) * Math.PI / 180;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const widthMm = Math.max(0.045, primitive.widthMm || primitive.pen_widthMm || height * 0.065);
+
+  const transform = (localX, localY) => [
+    originX + localX * cos - localY * sin,
+    originY + localX * sin + localY * cos,
+  ];
+
+  let cursor = 0;
+  for (const rawChar of text.toUpperCase()) {
+    if (rawChar === " " || rawChar === "\t") {
+      cursor += advance;
+      continue;
+    }
+    const strokes = GLYPH_SEGMENTS[rawChar] || ["AB", "BC", "CD", "DE", "EA", "AC"];
+    for (const stroke of strokes) {
+      const p0 = GLYPH_POINTS[stroke[0]];
+      const p1 = GLYPH_POINTS[stroke[1]];
+      if (!p0 || !p1) continue;
+      const a = transform(cursor + p0[0] * glyphWidth, p0[1] * height);
+      const b = transform(cursor + p1[0] * glyphWidth, p1[1] * height);
+      segments.push({ featureId, kind: "text", widthMm, a, b });
+    }
+    cursor += advance;
+  }
+}
+
 function shouldClosePolyline(primitive) {
   return ["plotpoly", "polygon", "polyline", "fill"].includes(String(primitive.kind || ""));
 }
@@ -971,7 +1084,7 @@ function isElectricalFeature(feature) {
 function vectorColor(feature, primitiveKind) {
   if (isElectricalFeature(feature)) return [0.12, 0.56, 0.2, 0.96];
   if (feature?.kind === "symbol_instance") return [0.42, 0.18, 0.18, 0.72];
-  if (feature?.kind === "text" || primitiveKind === "text") return [0.05, 0.13, 0.16, 0.85];
+  if (feature?.kind === "text" || primitiveKind === "text") return [0.05, 0.13, 0.16, 0.94];
   return [0.16, 0.17, 0.19, 0.7];
 }
 
