@@ -2,15 +2,13 @@
   "name": "kicad-3d-viz-dev-tools",
   "private": true,
   "scripts": {
-    "build:viewer": "esbuild viewer/semantic-gltf-loader-entry.mjs --bundle --minify --format=iife --platform=browser --external:node:fs --external:node:path --outfile=viewer/semantic-gltf-loader.js",
+    "build:viewer": "esbuild viewer/src/main.js --bundle --minify --format=iife --platform=browser --external:node:fs --external:node:path --outfile=viewer/app.js",
     "test:gltf": "node --test tools/semantic-gltf/*.test.mjs"
   },
   "dependencies": {
     "@gltf-transform/core": "^4.2.1",
     "@gltf-transform/extensions": "^4.2.1",
     "@gltf-transform/functions": "^4.2.1",
-    "@loaders.gl/core": "^4.3.4",
-    "@loaders.gl/gltf": "^4.3.4",
     "earcut": "^3.0.2",
     "esbuild": "^0.25.5",
     "meshoptimizer": "^0.24.0",

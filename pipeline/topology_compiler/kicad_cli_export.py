@@ -14,8 +14,6 @@ from typing import Any
 
 
 DEFAULT_KICAD_CLI = Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")
-PAD_GROUP_RE = re.compile(r'<group name="(?P<name>Pad_(?P<side>[^_]+)_(?P<ref>[^_]+)_(?P<pin>[^_]+)_(?P<net>.+?))" dimension="(?P<dimension>[^"]+)" count="(?P<count>\d+)">')
-GROUP_ELEMENT_RE = re.compile(r'<element index="(?P<index>\d+)"/>')
 
 
 @dataclass
@@ -146,8 +144,6 @@ def export_project_geometry(
         },
         "exports": [item.to_dict(output_dir) for item in exports],
         "components": _component_nodes(geometry_dir / "components.glb"),
-        "pad_groups": [],
-        "net_chunks": [],
         "visibility_groups": [
             {"id": "board", "label": "Board", "asset": "geometry/base_board.glb", "mesh_name_contains": ["_PCB"]},
             {"id": "silkscreen", "label": "Silkscreen", "asset": "geometry/base_board.glb", "mesh_name_contains": ["_silkscreen"]},
@@ -258,39 +254,3 @@ def _collect_mesh_names(nodes: list[dict[str, Any]], meshes: list[dict[str, Any]
     for child in node.get("children", []) or []:
         names.extend(_collect_mesh_names(nodes, meshes, int(child)))
     return names
-
-
-def _pad_groups(path: Path, topology: dict[str, Any]) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    terminal_lookup = {
-        (str(t.get("designator") or ""), str(t.get("pin") or ""), str(t.get("net_name") or "")): t
-        for t in topology.get("terminals", [])
-    }
-    text = path.read_text(encoding="utf-8", errors="replace")
-    groups = []
-    for match in PAD_GROUP_RE.finditer(text):
-        start = match.end()
-        end = text.find("</group>", start)
-        body = text[start:end] if end >= 0 else ""
-        elements = [int(item.group("index")) for item in GROUP_ELEMENT_RE.finditer(body)]
-        designator = match.group("ref")
-        pin = match.group("pin")
-        net_name = match.group("net")
-        terminal = terminal_lookup.get((designator, pin, net_name), {})
-        groups.append(
-            {
-                "group_name": match.group("name"),
-                "side": match.group("side"),
-                "designator": designator,
-                "pin": pin,
-                "net_name": net_name,
-                "terminal_uid": terminal.get("uid", ""),
-                "component_uid": terminal.get("component_uid", ""),
-                "net_uid": terminal.get("net_uid", ""),
-                "pcb_pad_id": terminal.get("pcb_pad_id", ""),
-                "dimension": match.group("dimension"),
-                "face_indexes": elements,
-            }
-        )
-    return groups

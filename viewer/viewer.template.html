@@ -12,11 +12,14 @@ $styles
     <main id="app">
       <section class="viewport-shell">
         <canvas id="viewport"></canvas>
+        <div id="panel-labels"></div>
+        <div id="hover-card" hidden></div>
+        <canvas id="axis-gizmo" width="84" height="84" title="Click X, Y, or Z region to align the camera"></canvas>
         <div id="fallback" hidden></div>
       </section>
       <aside class="panel">
         <header>
-          <p class="eyebrow">Topology Model A0</p>
+          <p class="eyebrow">Semantic GLTF A0</p>
           <h1>$title</h1>
           <p id="status">Booting renderer</p>
         </header>
@@ -36,11 +39,7 @@ $styles
     </main>
     <script>
       window.__TOPOLOGY__ = $topology_json;
-      window.__SCENE_BASE64__ = "$scene_base64";
       window.__SEMANTIC_GEOMETRY__ = $semantic_geometry_json;
-    </script>
-    <script>
-$gltf_loader
     </script>
     <script>
 $app

@@ -10,7 +10,8 @@ The PCB renderer consumes `prism.semantic_gltf_a0`:
 - `EXT_mesh_features` declares both feature domains;
 - `EXT_meshopt_compression` and `KHR_mesh_quantization` reduce transfer size;
 - `scene.manifest.json` stores nets, net classes, metrics, stackup, source
-  feature records, tile bounds, and `netToTiles`.
+  feature records, source/net bounds, component records, via/plated-hole
+  dimensions, tile bounds, and `netToTiles`.
 
 Render triangles carry compact IDs only. Net names, classes, lengths, source
 UUIDs, and analysis metadata are stored once in lookup tables.
@@ -26,14 +27,14 @@ Click-to-net reads `_FEATURE_ID_1`, resolves the source feature record, and
 then resolves its immutable net ID. No aggregate-mesh overlap heuristic is
 used.
 
-Layer View and 3D View render the same copper surfaces at real stackup heights.
-Layer View changes only the orthographic camera and visibility mask. Copper
-thickness remains metadata, allowing a solid inspection LOD or solver mesh to
-be generated without changing semantic ownership.
+Layer Compare and 3D View render the same copper surfaces at real stackup
+heights. Layer Compare changes camera projection, viewport and visibility
+masks. Via and plated-pad barrels use shared instanced geometry tied to the
+same source feature and net as their copper caps.
 
-KiCad GLB remains the source for board context and component models. STEP and
-Geometer remain suitable build-time paths for B-rep validation, component
-conversion, and MCAD interchange, but do not own PCB electrical semantics.
+KiCad GLB remains the source for board context and component models. STEP
+remains suitable for B-rep validation, component conversion, and MCAD
+interchange, but does not own PCB electrical semantics.
 
 ## Analysis Extension Contract
 

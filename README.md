@@ -4,8 +4,7 @@ WebGPU-first, CAD-neutral visualisation prototype inspired by Wavenumber's
 public 3D visualisation architecture.
 
 This directory intentionally stands apart from KiCAD-Prism. Prism integration
-is a future adapter; the runtime model here is a neutral topological scene
-model plus GPU-friendly render buffers.
+is a future adapter; the runtime is a standards-based semantic glTF scene.
 
 ## Layout
 
@@ -13,21 +12,20 @@ model plus GPU-friendly render buffers.
 - `pipeline/`: Python topology compiler, semantic glTF scene writer, and HTML
   exporter.
 - `viewer/`: WebGPU viewer and bundled standards-based glTF loader.
-- `samples/`: generated sample topology, scene, and standalone HTML.
+- `samples/`: generated project topology, semantic glTF tiles, and standalone HTML.
 - `tests/`: Python contract/unit tests.
 - `docs/`: implementation notes and reference repository SHAs.
 
 ## Quick Start
 
-Generate the sample bundle and standalone viewer:
+Generate the USB-PD fixture and standalone viewer:
 
 ```bash
-/Users/Swaroop/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 \
-  -m pipeline.topology_compiler sample --output samples/basic
+bash scripts/build_usb_pd_sample.sh
 ```
 
-Open `samples/basic/viewer.html` in a browser with WebGPU support. The viewer
-falls back to a Canvas 2D diagnostic mode if WebGPU is unavailable.
+Open `samples/usb-pd-trigger-board/viewer.html` through a local server in a
+browser with WebGPU support. WebGPU is the only production renderer.
 
 Run tests:
 
@@ -36,13 +34,7 @@ Run tests:
   -m unittest discover -s tests
 ```
 
-Build the USB-PD Trigger Board sample:
-
-```bash
-bash scripts/build_usb_pd_sample.sh
-```
-
-Install the JavaScript tooling and rebuild the embedded glTF loader after
+Install the JavaScript tooling and rebuild the embedded viewer after
 dependency changes:
 
 ```bash
@@ -60,14 +52,17 @@ Implemented now:
 - tiled `prism.semantic_gltf_a0` GLBs using `EXT_mesh_features`,
   `EXT_meshopt_compression`, and `KHR_mesh_quantization`.
 - `_FEATURE_ID_0` net ownership and `_FEATURE_ID_1` source-object ownership.
-- progressive WebGPU loading of only the active copper layer in Layer View.
-- click-to-net picking for tracks, zones, pads, and vias.
-- net metadata inspection and GPU net-class highlighting.
-- independent outer and inner copper layer views.
-- orbit, pan, zoom, net isolation, and exploded-stackup 3D controls.
+- progressive WebGPU loading of selected copper layers.
+- exact click-to-net picking for tracks, zones, pads, vias, and plated barrels.
+- perspective orbit, board-drag pan, damped navigation, axis views, and fit.
+- synchronized multi-layer comparison using scissored WebGPU viewports.
+- material-preserving component rendering with batched material draws.
+- quadratic exploded-stackup controls with stretched conductive barrels.
+- render-bundle caching for large stable draw sets.
 
 KiCad GLB is used only for board context and component models. Copper
 ownership is assigned from PCB IR before tessellation; no aggregate or per-net
 copper GLB is generated. Surface copper is the production render LOD at its
-real stackup height. Copper thickness remains metadata for later solid
-inspection and FEM meshing. Build inputs are cached under `samples/.cache/`.
+real stackup height. Via and plated-hole records provide authoritative
+conductive spans for later solid inspection and FEM meshing. Build inputs are
+cached under `samples/.cache/`.

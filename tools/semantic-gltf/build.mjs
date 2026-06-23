@@ -60,13 +60,16 @@ const manifest = {
   version: 0,
   tileSizeMm: tileSize,
   geometryRevision: input.geometryRevision,
+  coordinateSystem: input.coordinateSystem,
   layers: input.layers || [],
   nets: input.nets || [],
   objectFeatures: input.objectFeatures || [],
+  components: input.components || [],
+  barrels: input.barrels || [],
   copperLayerIds: (input.layers || [])
     .filter((layer) => layer.role === "copper" || String(layer.name || "").endsWith(".Cu"))
     .map((layer) => Number(layer.id)),
-  bbox: sceneBounds(input.objects || []),
+  bbox: sceneBounds(input.objects || [], input.barrels || []),
   tiles: [],
   netToTiles: {},
   analysis: {
@@ -252,7 +255,7 @@ function polygonBounds(polygon) {
   return [minX, minY, maxX, maxY];
 }
 
-function sceneBounds(objects) {
+function sceneBounds(objects, barrels) {
   let minX = Infinity;
   let minZ = Infinity;
   let maxX = -Infinity;
@@ -273,6 +276,16 @@ function sceneBounds(objects) {
         }
       }
     }
+  }
+  for (const barrel of barrels) {
+    const bounds = barrel.boundsMm || [];
+    if (bounds.length !== 6) continue;
+    minX = Math.min(minX, bounds[0]);
+    minZ = Math.min(minZ, bounds[1]);
+    minY = Math.min(minY, bounds[2]);
+    maxX = Math.max(maxX, bounds[3]);
+    maxZ = Math.max(maxZ, bounds[4]);
+    maxY = Math.max(maxY, bounds[5]);
   }
   if (!Number.isFinite(minX)) return { min: [0, 0, 0], max: [0.001, 0.001, 0.001] };
   return {

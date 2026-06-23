@@ -1,0 +1,577 @@
+const VERTEX_STRIDE = 40;
+const DRAW_UNIFORM_SIZE = 256;
+const GLOBAL_UNIFORM_SIZE = 96;
+
+const MAIN_SHADER = `
+struct Globals {
+  viewProjection: mat4x4f,
+  activeNet: u32,
+  selectedLayer: u32,
+  time: f32,
+  hasHighlight: f32,
+  lightDirection: vec4f,
+};
+struct Draw {
+  color: vec4f,
+  material: vec4f,
+  offset: vec4f,
+  flags: vec4f,
+};
+@group(0) @binding(0) var<uniform> globals: Globals;
+@group(0) @binding(1) var<uniform> draw: Draw;
+
+struct VertexInput {
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) netId: u32,
+  @location(3) objectId: u32,
+  @location(4) layerId: u32,
+  @location(5) materialId: u32,
+};
+struct VertexOutput {
+  @builtin(position) position: vec4f,
+  @location(0) normal: vec3f,
+  @location(1) @interpolate(flat) netId: u32,
+  @location(2) @interpolate(flat) objectId: u32,
+  @location(3) world: vec3f,
+};
+@vertex fn vs(input: VertexInput) -> VertexOutput {
+  var output: VertexOutput;
+  output.world = input.position + draw.offset.xyz;
+  output.position = globals.viewProjection * vec4f(output.world, 1.0);
+  output.normal = normalize(input.normal);
+  output.netId = input.netId;
+  output.objectId = input.objectId;
+  return output;
+}
+fn aces(color: vec3f) -> vec3f {
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3f(0), vec3f(1));
+}
+fn dither(position: vec2f, opacity: f32) -> bool {
+  let threshold = fract(dot(floor(position), vec2f(0.75487766, 0.56984029)));
+  return threshold > opacity;
+}
+@fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
+  let kind = u32(draw.flags.x);
+  let copper = kind == 1u;
+  let selected = globals.activeNet != 0u && input.netId == globals.activeNet;
+  var base = draw.color.rgb;
+  var opacity = draw.color.a;
+  if (selected && copper) {
+    let pulse = 0.88 + 0.12 * sin(globals.time * 3.2);
+    base = vec3f(0.1, 1.0, 0.22) * pulse;
+    opacity = 1.0;
+  } else if (globals.hasHighlight > 0.5 && copper) {
+    opacity = min(opacity, 0.28);
+  }
+  if (draw.flags.z > 0.5 && copper && !selected) { discard; }
+  opacity *= draw.flags.y;
+  if (opacity < 0.995 && dither(input.position.xy, opacity)) { discard; }
+  let normal = normalize(input.normal);
+  let light = normalize(globals.lightDirection.xyz);
+  let diffuse = max(dot(normal, light), 0.0);
+  let hemi = mix(0.28, 0.62, normal.z * 0.5 + 0.5);
+  let roughness = clamp(draw.material.y, 0.05, 1.0);
+  let metallic = clamp(draw.material.x, 0.0, 1.0);
+  let specular = pow(max(dot(normal, normalize(light + vec3f(0.3, -0.4, 0.85))), 0.0), mix(96.0, 6.0, roughness));
+  let lit = base * (hemi + diffuse * 0.72) + mix(vec3f(0.04), base, metallic) * specular * 0.5;
+  return vec4f(aces(lit), 1.0);
+}
+`;
+
+const PICK_SHADER = `
+struct Globals {
+  viewProjection: mat4x4f,
+  activeNet: u32,
+  selectedLayer: u32,
+  time: f32,
+  hasHighlight: f32,
+  lightDirection: vec4f,
+};
+struct Draw { color: vec4f, material: vec4f, offset: vec4f, flags: vec4f };
+@group(0) @binding(0) var<uniform> globals: Globals;
+@group(0) @binding(1) var<uniform> draw: Draw;
+struct Input {
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) netId: u32,
+  @location(3) objectId: u32,
+  @location(4) layerId: u32,
+  @location(5) materialId: u32,
+};
+struct Output {
+  @builtin(position) position: vec4f,
+  @location(0) @interpolate(flat) objectId: u32,
+};
+@vertex fn vs(input: Input) -> Output {
+  var output: Output;
+  output.position = globals.viewProjection * vec4f(input.position + draw.offset.xyz, 1.0);
+  output.objectId = input.objectId;
+  return output;
+}
+@fragment fn fs(input: Output) -> @location(0) u32 { return input.objectId; }
+`;
+
+const BARREL_SHADER = `
+struct Globals {
+  viewProjection: mat4x4f,
+  activeNet: u32,
+  selectedLayer: u32,
+  time: f32,
+  hasHighlight: f32,
+  lightDirection: vec4f,
+};
+struct Draw { color: vec4f, material: vec4f, offset: vec4f, flags: vec4f };
+@group(0) @binding(0) var<uniform> globals: Globals;
+@group(0) @binding(1) var<uniform> draw: Draw;
+@group(0) @binding(2) var<storage, read> layerOffsets: array<f32>;
+struct Input {
+  @location(0) unit: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) radiusMix: f32,
+  @location(3) dimensions: vec4f,
+  @location(4) span: vec2f,
+  @location(5) ids: vec4u,
+};
+struct Output {
+  @builtin(position) position: vec4f,
+  @location(0) normal: vec3f,
+  @location(1) @interpolate(flat) netId: u32,
+  @location(2) @interpolate(flat) objectId: u32,
+  @location(3) @interpolate(flat) visible: u32,
+};
+@vertex fn vs(input: Input) -> Output {
+  let radius = mix(input.dimensions.z, input.dimensions.w, input.radiusMix);
+  let z0 = input.span.x + layerOffsets[input.ids.z];
+  let z1 = input.span.y + layerOffsets[input.ids.w];
+  let world = vec3f(
+    input.dimensions.x + input.unit.x * radius,
+    input.dimensions.y + input.unit.y * radius,
+    mix(z0, z1, input.unit.z)
+  );
+  var output: Output;
+  output.position = globals.viewProjection * vec4f(world, 1.0);
+  output.normal = input.normal;
+  output.netId = input.ids.x;
+  output.objectId = input.ids.y;
+  output.visible = select(0u, 1u, globals.selectedLayer == 0u || (globals.selectedLayer >= input.ids.z && globals.selectedLayer <= input.ids.w));
+  return output;
+}
+fn dither(position: vec2f, opacity: f32) -> bool {
+  return fract(dot(floor(position), vec2f(0.75487766, 0.56984029))) > opacity;
+}
+@fragment fn fs(input: Output) -> @location(0) vec4f {
+  if (input.visible == 0u) { discard; }
+  let selected = globals.activeNet != 0u && input.netId == globals.activeNet;
+  var base = draw.color.rgb;
+  var opacity = draw.color.a;
+  if (selected) {
+    base = vec3f(0.1, 1.0, 0.22) * (0.88 + 0.12 * sin(globals.time * 3.2));
+    opacity = 1.0;
+  } else if (globals.hasHighlight > 0.5) {
+    opacity = 0.28;
+  }
+  if (draw.flags.z > 0.5 && !selected) { discard; }
+  if (opacity < 0.995 && dither(input.position.xy, opacity)) { discard; }
+  let light = normalize(globals.lightDirection.xyz);
+  let lit = base * (0.38 + max(dot(normalize(input.normal), light), 0.0) * 0.72);
+  return vec4f(lit, 1.0);
+}
+`;
+
+const BARREL_PICK_SHADER = `
+struct Globals {
+  viewProjection: mat4x4f,
+  activeNet: u32,
+  selectedLayer: u32,
+  time: f32,
+  hasHighlight: f32,
+  lightDirection: vec4f,
+};
+struct Draw { color: vec4f, material: vec4f, offset: vec4f, flags: vec4f };
+@group(0) @binding(0) var<uniform> globals: Globals;
+@group(0) @binding(1) var<uniform> draw: Draw;
+@group(0) @binding(2) var<storage, read> layerOffsets: array<f32>;
+struct Input {
+  @location(0) unit: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) radiusMix: f32,
+  @location(3) dimensions: vec4f,
+  @location(4) span: vec2f,
+  @location(5) ids: vec4u,
+};
+struct Output {
+  @builtin(position) position: vec4f,
+  @location(0) @interpolate(flat) objectId: u32,
+  @location(1) @interpolate(flat) visible: u32,
+};
+@vertex fn vs(input: Input) -> Output {
+  let radius = mix(input.dimensions.z, input.dimensions.w, input.radiusMix);
+  let world = vec3f(
+    input.dimensions.x + input.unit.x * radius,
+    input.dimensions.y + input.unit.y * radius,
+    mix(input.span.x + layerOffsets[input.ids.z], input.span.y + layerOffsets[input.ids.w], input.unit.z)
+  );
+  var output: Output;
+  output.position = globals.viewProjection * vec4f(world, 1.0);
+  output.objectId = input.ids.y;
+  output.visible = select(0u, 1u, globals.selectedLayer == 0u || (globals.selectedLayer >= input.ids.z && globals.selectedLayer <= input.ids.w));
+  return output;
+}
+@fragment fn fs(input: Output) -> @location(0) u32 {
+  if (input.visible == 0u) { discard; }
+  return input.objectId;
+}
+`;
+
+export class Renderer {
+  static async create(canvas) {
+    if (!navigator.gpu) throw new Error("WebGPU is unavailable in this browser");
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!adapter) throw new Error("No WebGPU adapter is available");
+    const device = await adapter.requestDevice();
+    return new Renderer(canvas, device);
+  }
+
+  constructor(canvas, device) {
+    this.canvas = canvas;
+    this.device = device;
+    this.context = canvas.getContext("webgpu");
+    this.format = navigator.gpu.getPreferredCanvasFormat();
+    this.context.configure({ device, format: this.format, alphaMode: "opaque" });
+    this.entries = [];
+    this.barrels = null;
+    this.globalBuffer = device.createBuffer({ size: GLOBAL_UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.layerOffsetBuffer = device.createBuffer({ size: 1024, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.bindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      ],
+    });
+    const layout = device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] });
+    const vertexBuffers = [{
+      arrayStride: VERTEX_STRIDE,
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: "float32x3" },
+        { shaderLocation: 1, offset: 12, format: "float32x3" },
+        { shaderLocation: 2, offset: 24, format: "uint32" },
+        { shaderLocation: 3, offset: 28, format: "uint32" },
+        { shaderLocation: 4, offset: 32, format: "uint32" },
+        { shaderLocation: 5, offset: 36, format: "uint32" },
+      ],
+    }];
+    this.pipeline = this.makePipeline(layout, MAIN_SHADER, this.format, vertexBuffers);
+    this.pickPipeline = this.makePipeline(layout, PICK_SHADER, "r32uint", vertexBuffers);
+    this.barrelPipeline = this.makeBarrelPipeline(layout, BARREL_SHADER, this.format);
+    this.barrelPickPipeline = this.makeBarrelPipeline(layout, BARREL_PICK_SHADER, "r32uint");
+    this.depth = null;
+    this.pickTexture = null;
+    this.pickRead = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    this.bundleCache = new Map();
+  }
+
+  makePipeline(layout, code, format, buffers) {
+    const module = this.device.createShaderModule({ code });
+    return this.device.createRenderPipeline({
+      layout,
+      vertex: { module, entryPoint: "vs", buffers },
+      fragment: { module, entryPoint: "fs", targets: [{ format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+      multisample: { count: 1 },
+    });
+  }
+
+  makeBarrelPipeline(layout, code, format) {
+    const module = this.device.createShaderModule({ code });
+    return this.device.createRenderPipeline({
+      layout,
+      vertex: {
+        module,
+        entryPoint: "vs",
+        buffers: [
+          {
+            arrayStride: 28,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x3" },
+              { shaderLocation: 1, offset: 12, format: "float32x3" },
+              { shaderLocation: 2, offset: 24, format: "float32" },
+            ],
+          },
+          {
+            arrayStride: 40,
+            stepMode: "instance",
+            attributes: [
+              { shaderLocation: 3, offset: 0, format: "float32x4" },
+              { shaderLocation: 4, offset: 16, format: "float32x2" },
+              { shaderLocation: 5, offset: 24, format: "uint32x4" },
+            ],
+          },
+        ],
+      },
+      fragment: { module, entryPoint: "fs", targets: [{ format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+    });
+  }
+
+  resize() {
+    const ratio = Math.min(devicePixelRatio || 1, 2);
+    const width = Math.max(1, Math.floor(this.canvas.clientWidth * ratio));
+    const height = Math.max(1, Math.floor(this.canvas.clientHeight * ratio));
+    if (this.canvas.width === width && this.canvas.height === height) return;
+    this.canvas.width = width;
+    this.canvas.height = height;
+    this.depth?.destroy();
+    this.pickTexture?.destroy();
+    this.depth = this.device.createTexture({ size: [width, height], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    this.pickTexture = this.device.createTexture({ size: [width, height], format: "r32uint", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  }
+
+  addPrimitive(primitive, metadata) {
+    const count = primitive.position.length / 3;
+    const vertices = new ArrayBuffer(count * VERTEX_STRIDE);
+    const view = new DataView(vertices);
+    for (let index = 0; index < count; index += 1) {
+      const offset = index * VERTEX_STRIDE;
+      for (let axis = 0; axis < 3; axis += 1) {
+        view.setFloat32(offset + axis * 4, primitive.position[index * 3 + axis], true);
+        view.setFloat32(offset + 12 + axis * 4, primitive.normal[index * 3 + axis], true);
+      }
+      view.setUint32(offset + 24, primitive.netId[index] || 0, true);
+      view.setUint32(offset + 28, primitive.objectFeatureId[index] || 0, true);
+      view.setUint32(offset + 32, metadata.layerId || 0, true);
+      view.setUint32(offset + 36, metadata.materialId || 0, true);
+    }
+    const vertexBuffer = this.device.createBuffer({ size: vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(vertexBuffer, 0, vertices);
+    const indices = primitive.indices instanceof Uint32Array ? primitive.indices : new Uint32Array(primitive.indices);
+    const indexBuffer = this.device.createBuffer({ size: indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(indexBuffer, 0, indices);
+    const drawBuffer = this.device.createBuffer({ size: DRAW_UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const bindGroup = this.device.createBindGroup({
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.globalBuffer } },
+        { binding: 1, resource: { buffer: drawBuffer } },
+        { binding: 2, resource: { buffer: this.layerOffsetBuffer } },
+      ],
+    });
+    const entry = { ...metadata, primitive, vertexBuffer, indexBuffer, indexCount: indices.length, drawBuffer, bindGroup };
+    this.entries.push(entry);
+    this.bundleCache.clear();
+    return entry;
+  }
+
+  setBarrels(records) {
+    if (!records?.length) return;
+    const segments = 20;
+    const vertices = [];
+    const indices = [];
+    for (const inner of [0, 1]) {
+      const base = vertices.length / 7;
+      for (let index = 0; index < segments; index += 1) {
+        const angle = (Math.PI * 2 * index) / segments;
+        const x = Math.cos(angle);
+        const y = Math.sin(angle);
+        for (const t of [0, 1]) vertices.push(x, y, t, inner ? -x : x, inner ? -y : y, 0, inner);
+      }
+      for (let index = 0; index < segments; index += 1) {
+        const next = (index + 1) % segments;
+        const a = base + index * 2;
+        const b = base + next * 2;
+        indices.push(a, b, b + 1, a, b + 1, a + 1);
+      }
+    }
+    const vertexArray = new Float32Array(vertices);
+    const indexArray = new Uint16Array(indices);
+    const instances = new ArrayBuffer(records.length * 40);
+    const view = new DataView(instances);
+    records.forEach((record, index) => {
+      const offset = index * 40;
+      view.setFloat32(offset, record.centerMm[0] / 1000, true);
+      view.setFloat32(offset + 4, -record.centerMm[1] / 1000, true);
+      view.setFloat32(offset + 8, Math.min(record.drillWidthMm, record.drillHeightMm) / 2000, true);
+      view.setFloat32(offset + 12, Math.max(record.outerWidthMm, record.outerHeightMm) / 2000, true);
+      view.setFloat32(offset + 16, record.startZMm / 1000, true);
+      view.setFloat32(offset + 20, record.endZMm / 1000, true);
+      view.setUint32(offset + 24, record.netId || 0, true);
+      view.setUint32(offset + 28, record.objectFeatureId || 0, true);
+      view.setUint32(offset + 32, record.startLayerId || 0, true);
+      view.setUint32(offset + 36, record.endLayerId || 0, true);
+    });
+    const vertexBuffer = this.device.createBuffer({ size: vertexArray.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    const indexBuffer = this.device.createBuffer({ size: indexArray.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    const instanceBuffer = this.device.createBuffer({ size: instances.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(vertexBuffer, 0, vertexArray);
+    this.device.queue.writeBuffer(indexBuffer, 0, indexArray);
+    this.device.queue.writeBuffer(instanceBuffer, 0, instances);
+    const drawBuffer = this.device.createBuffer({ size: DRAW_UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const bindGroup = this.device.createBindGroup({
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.globalBuffer } },
+        { binding: 1, resource: { buffer: drawBuffer } },
+        { binding: 2, resource: { buffer: this.layerOffsetBuffer } },
+      ],
+    });
+    this.barrels = { records, vertexBuffer, indexBuffer, instanceBuffer, indexCount: indexArray.length, instanceCount: records.length, drawBuffer, bindGroup };
+  }
+
+  render({ panels, activeNetId, time, layerOffsets, visibleLayers, showBoard, showComponents, componentOpacity, boardOpacity, isolateNet }) {
+    this.resize();
+    this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, new Float32Array(layerOffsets));
+    const targetView = this.context.getCurrentTexture().createView();
+    panels.forEach((panel, panelIndex) => {
+      const encoder = this.device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: targetView,
+          clearValue: { r: 0.91, g: 0.93, b: 0.94, a: 1 },
+          loadOp: panelIndex === 0 ? "clear" : "load",
+          storeOp: "store",
+        }],
+        depthStencilAttachment: { view: this.depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" },
+      });
+      const viewport = panel.viewport;
+      pass.setViewport(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
+      pass.setScissorRect(viewport.x, viewport.y, viewport.width, viewport.height);
+      this.writeGlobals(panel.matrix, activeNetId, panel.layerId, time);
+      const visibleEntries = this.entries.filter((entry) =>
+        this.visible(entry, panel.layerId, visibleLayers, showBoard, showComponents, componentOpacity));
+      for (const entry of visibleEntries) {
+        this.writeDraw(entry, activeNetId, componentOpacity, boardOpacity, isolateNet);
+      }
+      if (visibleEntries.length > 64) {
+        pass.executeBundles([this.renderBundle(visibleEntries, panel.layerId)]);
+      } else {
+        pass.setPipeline(this.pipeline);
+        for (const entry of visibleEntries) {
+        pass.setBindGroup(0, entry.bindGroup);
+        pass.setVertexBuffer(0, entry.vertexBuffer);
+        pass.setIndexBuffer(entry.indexBuffer, "uint32");
+        pass.drawIndexed(entry.indexCount);
+        }
+      }
+      if (this.barrels && (panel.layerId === 0 || visibleLayers.has(panel.layerId))) {
+        this.writeBarrelDraw(isolateNet);
+        pass.setPipeline(this.barrelPipeline);
+        pass.setBindGroup(0, this.barrels.bindGroup);
+        pass.setVertexBuffer(0, this.barrels.vertexBuffer);
+        pass.setVertexBuffer(1, this.barrels.instanceBuffer);
+        pass.setIndexBuffer(this.barrels.indexBuffer, "uint16");
+        pass.drawIndexed(this.barrels.indexCount, this.barrels.instanceCount);
+      }
+      pass.end();
+      this.device.queue.submit([encoder.finish()]);
+    });
+  }
+
+  visible(entry, panelLayer, visibleLayers, showBoard, showComponents, componentOpacity) {
+    if (entry.kind === "board") return panelLayer === 0 && showBoard;
+    if (entry.kind === "component") return panelLayer === 0 && showComponents && componentOpacity > 0.001;
+    return panelLayer ? entry.layerId === panelLayer : visibleLayers.has(entry.layerId);
+  }
+
+  writeGlobals(matrix, activeNetId, selectedLayer, time) {
+    const data = new ArrayBuffer(GLOBAL_UNIFORM_SIZE);
+    new Float32Array(data, 0, 16).set(matrix);
+    const view = new DataView(data);
+    view.setUint32(64, activeNetId || 0, true);
+    view.setUint32(68, selectedLayer || 0, true);
+    view.setFloat32(72, time, true);
+    view.setFloat32(76, activeNetId ? 1 : 0, true);
+    new Float32Array(data, 80, 4).set([0.35, -0.5, 0.8, 0]);
+    this.device.queue.writeBuffer(this.globalBuffer, 0, data);
+  }
+
+  writeDraw(entry, activeNetId, componentOpacity, boardOpacity = 1, isolateNet = false) {
+    const data = new Float32Array(DRAW_UNIFORM_SIZE / 4);
+    const color = entry.kind === "copper" ? entry.color : entry.material.baseColor;
+    data.set(color, 0);
+    data.set([entry.material.metallic || 0, entry.material.roughness ?? 0.72, 0, 0], 4);
+    data.set([0, 0, entry.layerOffset || 0, 0], 8);
+    const opacity = entry.kind === "component" ? componentOpacity : entry.kind === "board" ? boardOpacity : 1;
+    data.set([entry.kind === "copper" ? 1 : 0, opacity, isolateNet ? 1 : 0, 0], 12);
+    this.device.queue.writeBuffer(entry.drawBuffer, 0, data);
+  }
+
+  writeBarrelDraw(isolateNet = false) {
+    const data = new Float32Array(DRAW_UNIFORM_SIZE / 4);
+    data.set([0.55, 0.35, 0.16, 0.78], 0);
+    data.set([0.75, 0.32, 0, 0], 4);
+    data.set([1, 1, isolateNet ? 1 : 0, 0], 12);
+    this.device.queue.writeBuffer(this.barrels.drawBuffer, 0, data);
+  }
+
+  renderBundle(entries, panelLayerId) {
+    const key = `${panelLayerId}:${entries.map((entry) => this.entries.indexOf(entry)).join(",")}`;
+    const cached = this.bundleCache.get(key);
+    if (cached) return cached;
+    const encoder = this.device.createRenderBundleEncoder({
+      colorFormats: [this.format],
+      depthStencilFormat: "depth24plus",
+    });
+    encoder.setPipeline(this.pipeline);
+    for (const entry of entries) {
+      encoder.setBindGroup(0, entry.bindGroup);
+      encoder.setVertexBuffer(0, entry.vertexBuffer);
+      encoder.setIndexBuffer(entry.indexBuffer, "uint32");
+      encoder.drawIndexed(entry.indexCount);
+    }
+    const bundle = encoder.finish();
+    this.bundleCache.set(key, bundle);
+    return bundle;
+  }
+
+  async pick(panel, x, y, options) {
+    this.resize();
+    const pixelX = Math.max(0, Math.min(this.canvas.width - 1, Math.floor(x)));
+    const pixelY = Math.max(0, Math.min(this.canvas.height - 1, Math.floor(y)));
+    this.writeGlobals(panel.matrix, options.activeNetId, panel.layerId, performance.now() / 1000);
+    this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, new Float32Array(options.layerOffsets));
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: this.pickTexture.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" }],
+      depthStencilAttachment: { view: this.depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" },
+    });
+    pass.setViewport(panel.viewport.x, panel.viewport.y, panel.viewport.width, panel.viewport.height, 0, 1);
+    pass.setScissorRect(panel.viewport.x, panel.viewport.y, panel.viewport.width, panel.viewport.height);
+    pass.setPipeline(this.pickPipeline);
+    for (const entry of this.entries) {
+      if (!this.visible(entry, panel.layerId, options.visibleLayers, options.showBoard, options.showComponents, options.componentOpacity)) continue;
+      this.writeDraw(entry, options.activeNetId, options.componentOpacity, options.boardOpacity, options.isolateNet);
+      pass.setBindGroup(0, entry.bindGroup);
+      pass.setVertexBuffer(0, entry.vertexBuffer);
+      pass.setIndexBuffer(entry.indexBuffer, "uint32");
+      pass.drawIndexed(entry.indexCount);
+    }
+    if (this.barrels) {
+      this.writeBarrelDraw(options.isolateNet);
+      pass.setPipeline(this.barrelPickPipeline);
+      pass.setBindGroup(0, this.barrels.bindGroup);
+      pass.setVertexBuffer(0, this.barrels.vertexBuffer);
+      pass.setVertexBuffer(1, this.barrels.instanceBuffer);
+      pass.setIndexBuffer(this.barrels.indexBuffer, "uint16");
+      pass.drawIndexed(this.barrels.indexCount, this.barrels.instanceCount);
+    }
+    pass.end();
+    encoder.copyTextureToBuffer(
+      { texture: this.pickTexture, origin: { x: pixelX, y: pixelY } },
+      { buffer: this.pickRead, bytesPerRow: 256 },
+      { width: 1, height: 1 },
+    );
+    this.device.queue.submit([encoder.finish()]);
+    await this.pickRead.mapAsync(GPUMapMode.READ);
+    const value = new DataView(this.pickRead.getMappedRange()).getUint32(0, true);
+    this.pickRead.unmap();
+    return value;
+  }
+}

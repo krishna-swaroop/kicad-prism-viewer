@@ -3,22 +3,24 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .semantic_scene import KIND_IDS, _primitive_y_range, _read_glb_primitives
-from .semantic_scene_a4 import (
+from .glb_inspect import mesh_axis_range
+from .pcb_geometry import (
+    KIND_IDS,
     NM_TO_MM,
-    _capsule,
-    _circle,
-    _clean_ring,
-    _pad_rings,
-    _point_nm,
-    _sample_arc_op,
-    _transform,
+    capsule,
+    circle,
+    clean_ring,
+    pad_rings,
+    point_nm,
+    sample_arc_op,
+    transform,
 )
 
 
@@ -78,6 +80,12 @@ class SemanticGltfBuilder:
             }
         ]
         self.object_feature_by_key: dict[tuple[str, int, int, str], int] = {}
+        self.source_feature_by_key: dict[tuple[str, int, str], int] = {}
+        self.barrels: list[dict[str, Any]] = []
+        self.component_nodes: dict[str, dict[str, Any]] = {}
+        self.feature_bounds: dict[int, list[float]] = {}
+        self.net_bounds: dict[int, list[float]] = {}
+        self.net_layer_bounds: dict[int, dict[int, list[float]]] = defaultdict(dict)
         self.net_layers: dict[int, set[str]] = defaultdict(set)
         self.net_kind_counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self.net_trace_length: dict[int, float] = defaultdict(float)
@@ -88,15 +96,10 @@ class SemanticGltfBuilder:
             self._read_board_y_range(base_board_glb)
 
     def _read_board_y_range(self, path: Path) -> None:
-        ranges = [
-            _primitive_y_range(primitive)
-            for primitive in _read_glb_primitives(path)
-            if "_pcb" in primitive.mesh_name.lower()
-            and "_soldermask" not in primitive.mesh_name.lower()
-        ]
-        if ranges:
-            self.board_y_min_mm = min(item[0] for item in ranges) * 1000.0
-            self.board_y_max_mm = max(item[1] for item in ranges) * 1000.0
+        axis_range = mesh_axis_range(path, "_pcb", 1)
+        if axis_range:
+            self.board_y_min_mm = axis_range[0] * 1000.0
+            self.board_y_max_mm = axis_range[1] * 1000.0
 
     def _runtime_z_mm(self, centered_z_mm: float) -> float:
         if (
@@ -136,6 +139,53 @@ class SemanticGltfBuilder:
         )
         return feature_id
 
+    def _source_feature_id(
+        self,
+        source_uid: str,
+        net_id: int,
+        kind: str,
+        layer_ids: list[int],
+    ) -> int:
+        key = (source_uid, net_id, kind)
+        existing = self.source_feature_by_key.get(key)
+        if existing is not None:
+            return existing
+        feature_id = len(self.object_features)
+        self.source_feature_by_key[key] = feature_id
+        self.object_features.append(
+            {
+                "id": feature_id,
+                "sourceUid": source_uid,
+                "netId": net_id,
+                "layerId": layer_ids[0] if layer_ids else 0,
+                "layerIds": layer_ids,
+                "layerMask": self._layer_mask(layer_ids),
+                "kind": kind,
+            }
+        )
+        return feature_id
+
+    def _layer_mask(self, layer_ids: list[int]) -> int:
+        mask = 0
+        copper_ids = [int(layer["id"]) for layer in self.copper_layers]
+        for layer_id in layer_ids:
+            if layer_id in copper_ids:
+                mask |= 1 << copper_ids.index(layer_id)
+        return mask
+
+    @staticmethod
+    def _merge_bounds(current: list[float] | None, incoming: list[float]) -> list[float]:
+        if not current:
+            return list(incoming)
+        return [
+            min(current[0], incoming[0]),
+            min(current[1], incoming[1]),
+            min(current[2], incoming[2]),
+            max(current[3], incoming[3]),
+            max(current[4], incoming[4]),
+            max(current[5], incoming[5]),
+        ]
+
     def _append_polygon(
         self,
         *,
@@ -145,17 +195,29 @@ class SemanticGltfBuilder:
         kind: str,
         outer: list[tuple[float, float]],
         holes: list[list[tuple[float, float]]] | None = None,
+        feature_id: int | None = None,
     ) -> None:
-        outer = _clean_ring(outer)
-        holes = [_clean_ring(hole) for hole in holes or []]
+        outer = clean_ring(outer)
+        holes = [clean_ring(hole) for hole in holes or []]
         holes = [hole for hole in holes if len(hole) >= 3]
         layer = self.layer_by_name.get(layer_name)
         if len(outer) < 3 or not layer:
             return
         net_id = self.net_id_by_name.get(net_name, 0)
         layer_id = int(layer["id"])
-        feature_id = self._feature_id(source_uid, net_id, layer_id, kind)
+        feature_id = feature_id or self._feature_id(source_uid, net_id, layer_id, kind)
         z_mm = self._runtime_z_mm(float(layer.get("z_mm") or 0.0))
+        thickness_mm = float(layer.get("thickness_mm") or 0.035) or 0.035
+        xs = [point[0] for point in outer]
+        ys = [point[1] for point in outer]
+        bounds = [
+            min(xs),
+            min(ys),
+            z_mm - thickness_mm / 2.0,
+            max(xs),
+            max(ys),
+            z_mm + thickness_mm / 2.0,
+        ]
         self.objects.append(
             {
                 "netId": net_id,
@@ -163,7 +225,7 @@ class SemanticGltfBuilder:
                 "layerId": layer_id,
                 "layerName": layer_name,
                 "zMm": z_mm,
-                "thicknessMm": float(layer.get("thickness_mm") or 0.035) or 0.035,
+                "thicknessMm": thickness_mm,
                 "kindId": KIND_IDS.get(kind, KIND_IDS["unknown"]),
                 "polygons": [
                     {
@@ -175,6 +237,12 @@ class SemanticGltfBuilder:
                     }
                 ],
             }
+        )
+        self.feature_bounds[feature_id] = self._merge_bounds(self.feature_bounds.get(feature_id), bounds)
+        self.net_bounds[net_id] = self._merge_bounds(self.net_bounds.get(net_id), bounds)
+        self.net_layer_bounds[net_id][layer_id] = self._merge_bounds(
+            self.net_layer_bounds[net_id].get(layer_id),
+            bounds,
         )
         if net_id:
             self.net_layers[net_id].add(layer_name)
@@ -201,6 +269,13 @@ class SemanticGltfBuilder:
             elif kind == "footprint":
                 self._add_pads(record, pad_holes)
 
+    def add_component_nodes(self, nodes: list[dict[str, Any]]) -> None:
+        self.component_nodes = {
+            str(node.get("designator") or ""): node
+            for node in nodes
+            if node.get("designator")
+        }
+
     def _add_track(self, record: dict[str, Any]) -> None:
         layer = str(record.get("layer") or "")
         net_name = str(record.get("net_name") or "")
@@ -208,8 +283,8 @@ class SemanticGltfBuilder:
         for op in record.get("operations", []) or []:
             if op.get("kind") != "ThickSegment":
                 continue
-            start = _point_nm(op.get("start_x"), op.get("start_y"))
-            end = _point_nm(op.get("end_x"), op.get("end_y"))
+            start = point_nm(op.get("start_x"), op.get("start_y"))
+            end = point_nm(op.get("end_x"), op.get("end_y"))
             width = float(op.get("width_nm") or 0) * NM_TO_MM
             if width <= 0:
                 continue
@@ -218,7 +293,7 @@ class SemanticGltfBuilder:
                 net_name=net_name,
                 layer_name=layer,
                 kind="track",
-                outer=_capsule(start, end, width / 2.0),
+                outer=capsule(start, end, width / 2.0),
             )
             self.net_trace_length[self.net_id_by_name.get(net_name, 0)] += math.dist(start, end)
 
@@ -229,7 +304,7 @@ class SemanticGltfBuilder:
         for op in record.get("operations", []) or []:
             if op.get("kind") not in {"ArcThreePoint", "ThickArc"}:
                 continue
-            path = _sample_arc_op(op)
+            path = sample_arc_op(op)
             width = float(op.get("width_nm") or 0) * NM_TO_MM
             if width <= 0:
                 continue
@@ -239,7 +314,7 @@ class SemanticGltfBuilder:
                     net_name=net_name,
                     layer_name=layer,
                     kind="track_arc",
-                    outer=_capsule(start, end, width / 2.0),
+                    outer=capsule(start, end, width / 2.0),
                 )
                 self.net_trace_length[self.net_id_by_name.get(net_name, 0)] += math.dist(start, end)
 
@@ -261,7 +336,7 @@ class SemanticGltfBuilder:
                 net_name=str(record.get("net_name") or ""),
                 layer_name=layer,
                 kind="zone",
-                outer=[_point_nm(point[0], point[1]) for point in op.get("points", [])],
+                outer=[point_nm(point[0], point[1]) for point in op.get("points", [])],
             )
 
     def _add_via(self, record: dict[str, Any]) -> None:
@@ -272,11 +347,19 @@ class SemanticGltfBuilder:
         layers = self._layers_for(record.get("layers", []) or [])
         if not aperture or not layers:
             return
-        center = _point_nm(aperture.get("x"), aperture.get("y"))
+        center = point_nm(aperture.get("x"), aperture.get("y"))
         radius = float(aperture.get("diameter_nm") or 0) * NM_TO_MM / 2.0
         drill = float(record.get("drill") or 0.0)
-        outer = _circle(center, radius)
-        holes = [_circle(center, drill / 2.0)] if drill > 0 else []
+        outer = circle(center, radius)
+        holes = [circle(center, drill / 2.0)] if drill > 0 else []
+        net_id = self.net_id_by_name.get(str(record.get("net_name") or ""), 0)
+        layer_ids = [int(self.layer_by_name[layer]["id"]) for layer in layers]
+        feature_id = self._source_feature_id(
+            str(record.get("uuid") or ""),
+            net_id,
+            "via",
+            layer_ids,
+        )
         for layer in layers:
             self._append_polygon(
                 source_uid=str(record.get("uuid") or ""),
@@ -285,6 +368,19 @@ class SemanticGltfBuilder:
                 kind="via",
                 outer=outer,
                 holes=holes,
+                feature_id=feature_id,
+            )
+        if drill > 0:
+            self._append_barrel(
+                source_uid=str(record.get("uuid") or ""),
+                feature_id=feature_id,
+                net_id=net_id,
+                kind="via",
+                center=center,
+                drill_width=drill,
+                drill_height=drill,
+                layer_names=layers,
+                plating_thickness=0.025,
             )
 
     def _add_pads(
@@ -293,7 +389,7 @@ class SemanticGltfBuilder:
         pad_holes: dict[str, dict[str, Any]],
     ) -> None:
         placement = record.get("placement") or {}
-        origin = _point_nm(placement.get("x_nm"), placement.get("y_nm"))
+        origin = point_nm(placement.get("x_nm"), placement.get("y_nm"))
         angle = -float(placement.get("angle_deg") or 0.0)
         block: dict[str, Any] | None = None
         for op in record.get("operations", []) or []:
@@ -309,23 +405,98 @@ class SemanticGltfBuilder:
             source_uid = str(block.get("data_uuid") or block.get("label") or "")
             layers = self._layers_for(op.get("layers") or block.get("layers") or [])
             rings = [
-                [_transform(point, origin, angle) for point in ring]
-                for ring in _pad_rings(op)
+                [transform(point, origin, angle) for point in ring]
+                for ring in pad_rings(op)
             ]
             hole_info = pad_holes.get(source_uid) or {}
             drill = float(hole_info.get("drill_mm") or 0.0)
-            center = _transform(_point_nm(op.get("x"), op.get("y")), origin, angle)
-            holes = [_circle(center, drill / 2.0)] if drill > 0 else []
+            center = transform(point_nm(op.get("x"), op.get("y")), origin, angle)
+            holes = [circle(center, drill / 2.0)] if drill > 0 else []
+            net_name = str(attrs.get("net") or "")
+            net_id = self.net_id_by_name.get(net_name, 0)
+            layer_ids = [int(self.layer_by_name[layer]["id"]) for layer in layers]
+            is_plated = drill > 0 and bool(hole_info.get("plated", True))
+            feature_id = (
+                self._source_feature_id(source_uid, net_id, "pad", layer_ids)
+                if is_plated
+                else None
+            )
             for layer in layers:
                 for ring in rings:
                     self._append_polygon(
                         source_uid=source_uid,
-                        net_name=str(attrs.get("net") or ""),
+                        net_name=net_name,
                         layer_name=layer,
                         kind="pad",
                         outer=ring,
                         holes=holes,
+                        feature_id=feature_id,
                     )
+            if is_plated:
+                self._append_barrel(
+                    source_uid=source_uid,
+                    feature_id=int(feature_id),
+                    net_id=net_id,
+                    kind="plated_pad",
+                    center=center,
+                    drill_width=float(hole_info.get("drill_width_mm") or drill),
+                    drill_height=float(hole_info.get("drill_height_mm") or drill),
+                    layer_names=layers,
+                    plating_thickness=0.025,
+                )
+
+    def _append_barrel(
+        self,
+        *,
+        source_uid: str,
+        feature_id: int,
+        net_id: int,
+        kind: str,
+        center: tuple[float, float],
+        drill_width: float,
+        drill_height: float,
+        layer_names: list[str],
+        plating_thickness: float,
+    ) -> None:
+        layers = [self.layer_by_name[name] for name in layer_names if name in self.layer_by_name]
+        if not layers:
+            return
+        z_values = [
+            self._runtime_z_mm(float(layer.get("z_mm") or 0.0))
+            for layer in layers
+        ]
+        start_z, end_z = z_values[0], z_values[-1]
+        bounds = [
+            center[0] - drill_width / 2.0 - plating_thickness,
+            center[1] - drill_height / 2.0 - plating_thickness,
+            min(start_z, end_z),
+            center[0] + drill_width / 2.0 + plating_thickness,
+            center[1] + drill_height / 2.0 + plating_thickness,
+            max(start_z, end_z),
+        ]
+        record = {
+            "sourceUid": source_uid,
+            "objectFeatureId": feature_id,
+            "netId": net_id,
+            "kind": kind,
+            "centerMm": list(center),
+            "drillWidthMm": drill_width,
+            "drillHeightMm": drill_height,
+            "outerWidthMm": drill_width + plating_thickness * 2.0,
+            "outerHeightMm": drill_height + plating_thickness * 2.0,
+            "platingThicknessMm": plating_thickness,
+            "platingThicknessSource": "default",
+            "startLayerId": int(layers[0]["id"]),
+            "endLayerId": int(layers[-1]["id"]),
+            "layerIds": [int(layer["id"]) for layer in layers],
+            "layerMask": self._layer_mask([int(layer["id"]) for layer in layers]),
+            "startZMm": start_z,
+            "endZMm": end_z,
+            "boundsMm": bounds,
+        }
+        self.barrels.append(record)
+        self.feature_bounds[feature_id] = self._merge_bounds(self.feature_bounds.get(feature_id), bounds)
+        self.net_bounds[net_id] = self._merge_bounds(self.net_bounds.get(net_id), bounds)
 
     def write_input(self, path: Path, *, tile_size_mm: float = TILE_SIZE_MM) -> dict[str, Any]:
         for net in self.nets[1:]:
@@ -335,23 +506,68 @@ class SemanticGltfBuilder:
                 "layers": sorted(self.net_layers[net_id]),
                 "objectCounts": dict(sorted(self.net_kind_counts[net_id].items())),
             }
+            net["boundsMm"] = self.net_bounds.get(net_id)
+            net["layerBoundsMm"] = {
+                str(layer_id): bounds
+                for layer_id, bounds in sorted(self.net_layer_bounds[net_id].items())
+            }
+        for feature in self.object_features:
+            feature["boundsMm"] = self.feature_bounds.get(int(feature["id"]))
         revision_source = json.dumps(
             {
                 "layers": self.layers,
                 "nets": self.nets,
                 "objects": self.objects,
+                "barrels": self.barrels,
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        components = []
+        for component in self.topology.get("components", []) or []:
+            designator = str(component.get("designator") or "")
+            node = self.component_nodes.get(designator, {})
+            components.append(
+                {
+                    "id": len(components) + 1,
+                    "featureId": len(self.object_features) + len(components),
+                    "uid": str(component.get("uid") or ""),
+                    "designator": designator,
+                    "value": str(component.get("value") or ""),
+                    "footprint": str(component.get("footprint") or ""),
+                    "nodeIndex": node.get("node_index"),
+                    "meshNames": node.get("mesh_names", []),
+                }
+            )
         payload = {
             "schema": "prism.semantic_gltf_build_a0",
             "tileSizeMm": tile_size_mm,
             "geometryRevision": hashlib.sha256(revision_source).hexdigest(),
+            "coordinateSystem": {
+                "source": {
+                    "axes": {"x": "board-right", "y": "board-down", "z": "stackup-up"},
+                    "units": "millimetres",
+                    "handedness": "right",
+                },
+                "gltf": {
+                    "axes": {"x": "board-right", "y": "stackup-up", "z": "board-down"},
+                    "units": "millimetres",
+                    "handedness": "right",
+                },
+                "runtime": {
+                    "axes": {"x": "board-right", "y": "board-up", "z": "stackup-up"},
+                    "sourceToRuntime": ["x", "-y", "z"],
+                    "gltfToRuntime": ["x", "-z", "y"],
+                    "units": "millimetres",
+                    "handedness": "right",
+                },
+            },
             "layers": self.layers,
             "nets": self.nets,
             "objectFeatures": self.object_features,
             "objects": self.objects,
+            "barrels": self.barrels,
+            "components": components,
         }
         path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         return payload
@@ -371,6 +587,7 @@ def build_semantic_gltf_scene(
     base_path = output_dir / base_asset if base_asset else None
     builder = SemanticGltfBuilder(topology, base_path)
     builder.add_pcb_ir(pcb_ir, pad_holes=pad_holes)
+    builder.add_component_nodes(semantic_geometry.get("components", []) or [])
     scene_dir = output_dir / "scene-gltf"
     tool = Path(__file__).resolve().parents[2] / "tools" / "semantic-gltf" / "build.mjs"
     cache_dir = output_dir.parent / ".cache" / "semantic-gltf"
@@ -381,14 +598,23 @@ def build_semantic_gltf_scene(
         input_path = cache_dir / f"{payload['geometryRevision']}.json"
         if not input_path.exists():
             input_path.write_bytes(scratch_input.read_bytes())
-    proc = subprocess.run(
-        ["node", str(tool), str(input_path), str(scene_dir)],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"Semantic GLB build failed: {proc.stderr or proc.stdout}")
     manifest_path = scene_dir / "scene.manifest.json"
+    existing_manifest = None
+    if manifest_path.exists():
+        existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cache_hit = bool(
+        existing_manifest
+        and existing_manifest.get("geometryRevision") == payload["geometryRevision"]
+    )
+    if not cache_hit:
+        shutil.rmtree(scene_dir, ignore_errors=True)
+        proc = subprocess.run(
+            ["node", str(tool), str(input_path), str(scene_dir)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"Semantic GLB build failed: {proc.stderr or proc.stdout}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return {
         "schema": SCHEMA,
