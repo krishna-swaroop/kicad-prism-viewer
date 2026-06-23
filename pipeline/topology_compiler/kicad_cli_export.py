@@ -88,12 +88,13 @@ def export_project_geometry(
                 "--output",
                 str(geometry_dir / "base_board.glb"),
                 "--no-components",
+                "--include-pads",
                 "--include-silkscreen",
                 "--include-soldermask",
                 str(pcb_file),
             ],
             cache_dir=cache_dir,
-            cache_key=f"{pcb_hash}-{cli_version}-board-context-a4",
+            cache_key=f"{pcb_hash}-{cli_version}-board-context-pads-a5",
         )
     )
     component_export = _run_cached_export(

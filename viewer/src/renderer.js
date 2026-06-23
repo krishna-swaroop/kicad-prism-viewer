@@ -52,26 +52,18 @@ fn aces(color: vec3f) -> vec3f {
   let e = 0.14;
   return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3f(0), vec3f(1));
 }
-fn dither(position: vec2f, opacity: f32) -> bool {
-  let threshold = fract(dot(floor(position), vec2f(0.75487766, 0.56984029)));
-  return threshold > opacity;
-}
 @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
   let kind = u32(draw.flags.x);
   let copper = kind == 1u;
   let selected = globals.activeNet != 0u && input.netId == globals.activeNet;
   var base = draw.color.rgb;
-  var opacity = draw.color.a;
   if (selected && copper) {
     let pulse = 0.88 + 0.12 * sin(globals.time * 3.2);
-    base = vec3f(0.1, 1.0, 0.22) * pulse;
-    opacity = 1.0;
+    base = vec3f(0.08, 1.0, 0.2) * pulse;
   } else if (globals.hasHighlight > 0.5 && copper) {
-    opacity = min(opacity, 0.28);
+    base = mix(base, vec3f(0.12, 0.14, 0.17), 0.58);
   }
   if (draw.flags.z > 0.5 && copper && !selected) { discard; }
-  opacity *= draw.flags.y;
-  if (opacity < 0.995 && dither(input.position.xy, opacity)) { discard; }
   let normal = normalize(input.normal);
   let light = normalize(globals.lightDirection.xyz);
   let diffuse = max(dot(normal, light), 0.0);
@@ -79,7 +71,9 @@ fn dither(position: vec2f, opacity: f32) -> bool {
   let roughness = clamp(draw.material.y, 0.05, 1.0);
   let metallic = clamp(draw.material.x, 0.0, 1.0);
   let specular = pow(max(dot(normal, normalize(light + vec3f(0.3, -0.4, 0.85))), 0.0), mix(96.0, 6.0, roughness));
-  let lit = base * (hemi + diffuse * 0.72) + mix(vec3f(0.04), base, metallic) * specular * 0.5;
+  let shaded = base * (hemi + diffuse * 0.72) + mix(vec3f(0.04), base, metallic) * specular * 0.5;
+  var lit = select(shaded, base, draw.flags.w > 0.5);
+  lit *= draw.flags.y;
   return vec4f(aces(lit), 1.0);
 }
 `;
@@ -162,22 +156,16 @@ struct Output {
   output.visible = select(0u, 1u, globals.selectedLayer == 0u || (globals.selectedLayer >= input.ids.z && globals.selectedLayer <= input.ids.w));
   return output;
 }
-fn dither(position: vec2f, opacity: f32) -> bool {
-  return fract(dot(floor(position), vec2f(0.75487766, 0.56984029))) > opacity;
-}
 @fragment fn fs(input: Output) -> @location(0) vec4f {
   if (input.visible == 0u) { discard; }
   let selected = globals.activeNet != 0u && input.netId == globals.activeNet;
   var base = draw.color.rgb;
-  var opacity = draw.color.a;
   if (selected) {
     base = vec3f(0.1, 1.0, 0.22) * (0.88 + 0.12 * sin(globals.time * 3.2));
-    opacity = 1.0;
   } else if (globals.hasHighlight > 0.5) {
-    opacity = 0.28;
+    base = mix(base, vec3f(0.12, 0.14, 0.17), 0.58);
   }
   if (draw.flags.z > 0.5 && !selected) { discard; }
-  if (opacity < 0.995 && dither(input.position.xy, opacity)) { discard; }
   let light = normalize(globals.lightDirection.xyz);
   let lit = base * (0.38 + max(dot(normalize(input.normal), light), 0.0) * 0.72);
   return vec4f(lit, 1.0);
@@ -241,6 +229,12 @@ export class Renderer {
   constructor(canvas, device) {
     this.canvas = canvas;
     this.device = device;
+    device.addEventListener("uncapturederror", (event) => {
+      console.error(`Uncaptured WebGPU error: ${event.error?.message || event.error}`);
+    });
+    device.lost.then((info) => {
+      console.error(`WebGPU device lost: ${info.reason}`, info.message);
+    });
     this.context = canvas.getContext("webgpu");
     this.format = navigator.gpu.getPreferredCanvasFormat();
     this.context.configure({ device, format: this.format, alphaMode: "opaque" });
@@ -273,7 +267,7 @@ export class Renderer {
     this.barrelPickPipeline = this.makeBarrelPipeline(layout, BARREL_PICK_SHADER, "r32uint");
     this.depth = null;
     this.pickTexture = null;
-    this.pickRead = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    this.pickSerial = Promise.resolve();
     this.bundleCache = new Map();
   }
 
@@ -425,7 +419,20 @@ export class Renderer {
     this.barrels = { records, vertexBuffer, indexBuffer, instanceBuffer, indexCount: indexArray.length, instanceCount: records.length, drawBuffer, bindGroup };
   }
 
-  render({ panels, activeNetId, time, layerOffsets, visibleLayers, showBoard, showComponents, componentOpacity, boardOpacity, isolateNet }) {
+  render({
+    panels,
+    activeNetId,
+    time,
+    layerOffsets,
+    visibleLayers,
+    showBoard,
+    showComponents,
+    componentOpacity,
+    boardOpacity,
+    isolateNet,
+    compareMode = false,
+    compareOffsets = new Map(),
+  }) {
     this.resize();
     this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, new Float32Array(layerOffsets));
     const targetView = this.context.getCurrentTexture().createView();
@@ -440,14 +447,22 @@ export class Renderer {
         }],
         depthStencilAttachment: { view: this.depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" },
       });
-      const viewport = panel.viewport;
+      const viewport = clampViewport(panel.viewport, this.canvas.width, this.canvas.height);
       pass.setViewport(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
       pass.setScissorRect(viewport.x, viewport.y, viewport.width, viewport.height);
       this.writeGlobals(panel.matrix, activeNetId, panel.layerId, time);
       const visibleEntries = this.entries.filter((entry) =>
-        this.visible(entry, panel.layerId, visibleLayers, showBoard, showComponents, componentOpacity));
+        this.visible(entry, panel.layerId, visibleLayers, showBoard, showComponents, componentOpacity, compareMode));
       for (const entry of visibleEntries) {
-        this.writeDraw(entry, activeNetId, componentOpacity, boardOpacity, isolateNet);
+        this.writeDraw(
+          entry,
+          activeNetId,
+          componentOpacity,
+          boardOpacity,
+          isolateNet,
+          compareMode,
+          compareOffsets.get(entry.layerId),
+        );
       }
       if (visibleEntries.length > 64) {
         pass.executeBundles([this.renderBundle(visibleEntries, panel.layerId)]);
@@ -460,7 +475,7 @@ export class Renderer {
         pass.drawIndexed(entry.indexCount);
         }
       }
-      if (this.barrels && (panel.layerId === 0 || visibleLayers.has(panel.layerId))) {
+      if (!compareMode && this.barrels && (panel.layerId === 0 || visibleLayers.has(panel.layerId))) {
         this.writeBarrelDraw(isolateNet);
         pass.setPipeline(this.barrelPipeline);
         pass.setBindGroup(0, this.barrels.bindGroup);
@@ -474,7 +489,8 @@ export class Renderer {
     });
   }
 
-  visible(entry, panelLayer, visibleLayers, showBoard, showComponents, componentOpacity) {
+  visible(entry, panelLayer, visibleLayers, showBoard, showComponents, componentOpacity, compareMode = false) {
+    if (compareMode) return entry.kind === "copper" && visibleLayers.has(entry.layerId);
     if (entry.kind === "board") return panelLayer === 0 && showBoard;
     if (entry.kind === "component") return panelLayer === 0 && showComponents && componentOpacity > 0.001;
     return panelLayer ? entry.layerId === panelLayer : visibleLayers.has(entry.layerId);
@@ -492,14 +508,27 @@ export class Renderer {
     this.device.queue.writeBuffer(this.globalBuffer, 0, data);
   }
 
-  writeDraw(entry, activeNetId, componentOpacity, boardOpacity = 1, isolateNet = false) {
+  writeDraw(
+    entry,
+    activeNetId,
+    componentOpacity,
+    boardOpacity = 1,
+    isolateNet = false,
+    compareMode = false,
+    compareOffset = null,
+  ) {
     const data = new Float32Array(DRAW_UNIFORM_SIZE / 4);
     const color = entry.kind === "copper" ? entry.color : entry.material.baseColor;
     data.set(color, 0);
     data.set([entry.material.metallic || 0, entry.material.roughness ?? 0.72, 0, 0], 4);
-    data.set([0, 0, entry.layerOffset || 0, 0], 8);
+    data.set([
+      compareOffset?.[0] || 0,
+      compareOffset?.[1] || 0,
+      compareMode ? -(entry.baseZ || 0) : entry.layerOffset || 0,
+      0,
+    ], 8);
     const opacity = entry.kind === "component" ? componentOpacity : entry.kind === "board" ? boardOpacity : 1;
-    data.set([entry.kind === "copper" ? 1 : 0, opacity, isolateNet ? 1 : 0, 0], 12);
+    data.set([entry.kind === "copper" ? 1 : 0, opacity, isolateNet ? 1 : 0, compareMode ? 1 : 0], 12);
     this.device.queue.writeBuffer(entry.drawBuffer, 0, data);
   }
 
@@ -531,7 +560,13 @@ export class Renderer {
     return bundle;
   }
 
-  async pick(panel, x, y, options) {
+  pick(panel, x, y, options) {
+    const operation = this.pickSerial.then(() => this.performPick(panel, x, y, options));
+    this.pickSerial = operation.catch(() => 0);
+    return operation;
+  }
+
+  async performPick(panel, x, y, options) {
     this.resize();
     const pixelX = Math.max(0, Math.min(this.canvas.width - 1, Math.floor(x)));
     const pixelY = Math.max(0, Math.min(this.canvas.height - 1, Math.floor(y)));
@@ -542,18 +577,36 @@ export class Renderer {
       colorAttachments: [{ view: this.pickTexture.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" }],
       depthStencilAttachment: { view: this.depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" },
     });
-    pass.setViewport(panel.viewport.x, panel.viewport.y, panel.viewport.width, panel.viewport.height, 0, 1);
-    pass.setScissorRect(panel.viewport.x, panel.viewport.y, panel.viewport.width, panel.viewport.height);
+    const viewport = clampViewport(panel.viewport, this.canvas.width, this.canvas.height);
+    pass.setViewport(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
+    pass.setScissorRect(viewport.x, viewport.y, viewport.width, viewport.height);
     pass.setPipeline(this.pickPipeline);
     for (const entry of this.entries) {
-      if (!this.visible(entry, panel.layerId, options.visibleLayers, options.showBoard, options.showComponents, options.componentOpacity)) continue;
-      this.writeDraw(entry, options.activeNetId, options.componentOpacity, options.boardOpacity, options.isolateNet);
+      if (!this.visible(
+        entry,
+        panel.layerId,
+        options.visibleLayers,
+        options.showBoard,
+        options.showComponents,
+        options.componentOpacity,
+        options.compareMode,
+      )) continue;
+      if (entry.kind === "board") continue;
+      this.writeDraw(
+        entry,
+        options.activeNetId,
+        options.componentOpacity,
+        options.boardOpacity,
+        options.isolateNet,
+        options.compareMode,
+        options.compareOffsets?.get(entry.layerId),
+      );
       pass.setBindGroup(0, entry.bindGroup);
       pass.setVertexBuffer(0, entry.vertexBuffer);
       pass.setIndexBuffer(entry.indexBuffer, "uint32");
       pass.drawIndexed(entry.indexCount);
     }
-    if (this.barrels) {
+    if (!options.compareMode && this.barrels) {
       this.writeBarrelDraw(options.isolateNet);
       pass.setPipeline(this.barrelPickPipeline);
       pass.setBindGroup(0, this.barrels.bindGroup);
@@ -563,15 +616,36 @@ export class Renderer {
       pass.drawIndexed(this.barrels.indexCount, this.barrels.instanceCount);
     }
     pass.end();
+    const readBuffer = this.device.createBuffer({
+      label: "pick-readback",
+      size: 256,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
     encoder.copyTextureToBuffer(
       { texture: this.pickTexture, origin: { x: pixelX, y: pixelY } },
-      { buffer: this.pickRead, bytesPerRow: 256 },
+      { buffer: readBuffer, bytesPerRow: 256 },
       { width: 1, height: 1 },
     );
     this.device.queue.submit([encoder.finish()]);
-    await this.pickRead.mapAsync(GPUMapMode.READ);
-    const value = new DataView(this.pickRead.getMappedRange()).getUint32(0, true);
-    this.pickRead.unmap();
-    return value;
+    try {
+      await readBuffer.mapAsync(GPUMapMode.READ);
+      const value = new DataView(readBuffer.getMappedRange()).getUint32(0, true);
+      readBuffer.unmap();
+      return value;
+    } finally {
+      if (readBuffer.mapState === "mapped") readBuffer.unmap();
+      readBuffer.destroy();
+    }
   }
+}
+
+function clampViewport(viewport, width, height) {
+  const x = Math.max(0, Math.min(width - 1, Math.floor(viewport.x)));
+  const y = Math.max(0, Math.min(height - 1, Math.floor(viewport.y)));
+  return {
+    x,
+    y,
+    width: Math.max(1, Math.min(width - x, Math.floor(viewport.width))),
+    height: Math.max(1, Math.min(height - y, Math.floor(viewport.height))),
+  };
 }
