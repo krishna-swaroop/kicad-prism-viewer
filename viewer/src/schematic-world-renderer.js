@@ -233,7 +233,7 @@ export class SchematicWorldRenderer {
           },
         }],
       },
-      primitive: { topology: "line-list" },
+      primitive: { topology: "triangle-list" },
     });
     this.edgeBindGroup = device.createBindGroup({
       layout: this.edgeLayout,
@@ -258,7 +258,7 @@ export class SchematicWorldRenderer {
           },
         }],
       },
-      primitive: { topology: "line-list" },
+      primitive: { topology: "triangle-list" },
     });
     this.highlightBufferSize = 4 * 1024 * 1024;
     this.highlightBuffer = device.createBuffer({
@@ -532,9 +532,10 @@ export class SchematicWorldRenderer {
           : vectorColor(feature, segment.kind);
         const a = this.sourceToWorld(page, segment.a);
         const b = this.sourceToWorld(page, segment.b);
-        floats.push(a[0], a[1], ...color, b[0], b[1], ...color);
+        const width = this.segmentWorldWidth(page, segment, feature, isSelectedNet);
+        appendStrokeQuad(floats, a, b, width, color);
         selectedFeatureIds.add(segment.featureId);
-        if (floats.length >= MAX_VECTOR_FLOATS - 12) break;
+        if (floats.length >= MAX_VECTOR_FLOATS - 36) break;
       }
     }
     if (!floats.length) return 0;
@@ -763,12 +764,12 @@ export class SchematicWorldRenderer {
       const chunk = this.vectorChunks.get(page.id);
       if (!chunk?.segments?.length) continue;
       for (const segment of chunk.segments) {
-        if (count + 2 > MAX_PICK_VERTICES) break;
+        if (count + 6 > MAX_PICK_VERTICES) break;
+        const feature = this.featuresById.get(segment.featureId);
         const a = this.sourceToWorld(page, segment.a);
         const b = this.sourceToWorld(page, segment.b);
-        writePickVertex(view, count, a, segment.featureId);
-        writePickVertex(view, count + 1, b, segment.featureId);
-        count += 2;
+        const width = Math.max(this.segmentWorldWidth(page, segment, feature, false), this.scale * 7);
+        count = writePickStrokeQuad(view, count, a, b, width, segment.featureId);
       }
     }
     if (!count) return 0;
@@ -823,14 +824,20 @@ export class SchematicWorldRenderer {
     if (!chunk?.loaded) return null;
     let best = null;
     for (const segment of chunk.segments) {
-      const distance = pointSegmentDistance([sourceX, sourceY], segment.a, segment.b);
-      if (distance > tolerance) continue;
       const feature = this.featuresById.get(segment.featureId);
+      const widthTolerance = Math.max(tolerance, (segment.widthMm || 0) * 0.5 + tolerance * 0.45);
+      const distance = pointSegmentDistance([sourceX, sourceY], segment.a, segment.b);
+      if (distance > widthTolerance) continue;
       if (!feature) continue;
       const score = distance + (isElectricalFeature(feature) ? 0 : 100);
       if (!best || score < best.score) best = { feature, score };
     }
     return best?.feature || null;
+  }
+
+  segmentWorldWidth(page, segment, feature, selected) {
+    const sourceWidth = (segment.widthMm || 0.15) / Math.max(1, page.sourceWidthMm) * page.widthMm;
+    return Math.max(sourceWidth, this.scale * nativeStrokePixelWidth(feature, segment.kind, selected));
   }
 
   pan(dx, dy) {
@@ -892,7 +899,8 @@ function primitiveSegments(primitives) {
   for (const primitive of primitives) {
     const featureId = Number(primitive.featureId || 0);
     if (!featureId) continue;
-    const add = (a, b) => segments.push({ featureId, kind: primitive.kind, a, b });
+    const widthMm = primitive.widthMm || primitive.pen_widthMm || 0.15;
+    const add = (a, b) => segments.push({ featureId, kind: primitive.kind, widthMm, a, b });
     const x1 = primitive.x1Mm;
     const y1 = primitive.y1Mm;
     const x2 = primitive.x2Mm;
@@ -915,7 +923,7 @@ function primitiveSegments(primitives) {
       }
     } else if (Number.isFinite(primitive.cxMm) && Number.isFinite(primitive.cyMm)) {
       const radius = primitive.radiusMm || primitive.diameterMm / 2 || 0.4;
-      appendCircle(segments, featureId, primitive.kind, [primitive.cxMm, primitive.cyMm], radius);
+      appendCircle(segments, featureId, primitive.kind, [primitive.cxMm, primitive.cyMm], radius, widthMm);
     } else if (
       Number.isFinite(primitive.start_xMm)
       && Number.isFinite(primitive.start_yMm)
@@ -937,7 +945,7 @@ function primitiveSegments(primitives) {
   return segments;
 }
 
-function appendCircle(segments, featureId, kind, center, radius) {
+function appendCircle(segments, featureId, kind, center, radius, widthMm) {
   const steps = 32;
   for (let index = 0; index < steps; index += 1) {
     const a = index / steps * Math.PI * 2;
@@ -945,6 +953,7 @@ function appendCircle(segments, featureId, kind, center, radius) {
     segments.push({
       featureId,
       kind,
+      widthMm,
       a: [center[0] + Math.cos(a) * radius, center[1] + Math.sin(a) * radius],
       b: [center[0] + Math.cos(b) * radius, center[1] + Math.sin(b) * radius],
     });
@@ -966,6 +975,34 @@ function vectorColor(feature, primitiveKind) {
   return [0.16, 0.17, 0.19, 0.7];
 }
 
+function nativeStrokePixelWidth(feature, primitiveKind, selected) {
+  if (selected) return 5.5;
+  if (primitiveKind === "bus" || feature?.kind === "bus") return 4.2;
+  if (isElectricalFeature(feature)) return 2.6;
+  if (feature?.kind === "symbol_instance" || feature?.kind === "sheet") return 1.5;
+  return 1.25;
+}
+
+function appendStrokeQuad(values, a, b, width, color) {
+  const quad = strokeQuadPoints(a, b, width);
+  if (!quad) return;
+  for (const point of quad) values.push(point[0], point[1], ...color);
+}
+
+function strokeQuadPoints(a, b, width) {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const length = Math.hypot(dx, dy);
+  if (length < 1e-6) return null;
+  const nx = -dy / length * width * 0.5;
+  const ny = dx / length * width * 0.5;
+  const p0 = [a[0] + nx, a[1] + ny];
+  const p1 = [a[0] - nx, a[1] - ny];
+  const p2 = [b[0] + nx, b[1] + ny];
+  const p3 = [b[0] - nx, b[1] - ny];
+  return [p0, p1, p2, p2, p1, p3];
+}
+
 function pointSegmentDistance(point, a, b) {
   const dx = b[0] - a[0];
   const dy = b[1] - a[1];
@@ -981,4 +1018,14 @@ function writePickVertex(view, index, point, featureId) {
   view.setFloat32(offset, point[0], true);
   view.setFloat32(offset + 4, point[1], true);
   view.setUint32(offset + 8, featureId, true);
+}
+
+function writePickStrokeQuad(view, index, a, b, width, featureId) {
+  const quad = strokeQuadPoints(a, b, width);
+  if (!quad) return index;
+  for (const point of quad) {
+    writePickVertex(view, index, point, featureId);
+    index += 1;
+  }
+  return index;
 }

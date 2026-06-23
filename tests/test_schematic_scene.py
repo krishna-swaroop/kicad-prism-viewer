@@ -54,7 +54,12 @@ class SchematicSceneSchemaTests(unittest.TestCase):
         self.assertIsNone(primitive)
         self.assertEqual(unsupported, "Unsupported")
 
+    def test_render_block_markers_are_ignored(self):
+        primitive, unsupported = _operation_to_primitive(FakeOperation({"kind": "StartBlock"}), 7)
+
+        self.assertIsNone(primitive)
+        self.assertIsNone(unsupported)
+
 
 if __name__ == "__main__":
     unittest.main()
-

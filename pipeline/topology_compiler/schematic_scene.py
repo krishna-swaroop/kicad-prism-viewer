@@ -51,6 +51,7 @@ COORDINATE_KEYS = {
     "size_x_nm",
     "size_y_nm",
 }
+NON_GEOMETRY_OPERATION_KINDS = {"StartBlock", "EndBlock"}
 
 
 def _mm(value: Any) -> float:
@@ -70,6 +71,8 @@ def stable_feature_key(sheet_instance_path: str, source_id: str, sub_feature_ind
 def _operation_to_primitive(operation: Any, feature_id: int) -> tuple[dict[str, Any] | None, str | None]:
     data = operation.to_dict() if hasattr(operation, "to_dict") else dict(operation)
     kind = str(data.get("kind") or "unknown")
+    if kind in NON_GEOMETRY_OPERATION_KINDS:
+        return None, None
     lowered = kind.lower()
     primitive: dict[str, Any] = {"featureId": feature_id, "kind": lowered}
 
