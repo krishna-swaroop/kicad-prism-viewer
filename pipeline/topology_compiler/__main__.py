@@ -83,8 +83,8 @@ def cmd_from_project(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"error: semantic PCB geometry export failed for {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(3)
-        topology["design"].setdefault("assets", {})["semantic_geometry"] = "semantic_geometry.json"
-        topology["design"]["assets"]["geometry_mode"] = "semantic-gltf"
+    topology["design"].setdefault("assets", {})["semantic_geometry"] = "semantic_geometry.json"
+    topology["design"]["assets"]["geometry_mode"] = "semantic-gltf"
     _write_outputs(topology, args.output, semantic_geometry)
 
 

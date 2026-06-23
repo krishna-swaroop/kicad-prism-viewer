@@ -16,7 +16,7 @@ const viewControlsEl = document.getElementById("view-controls");
 const fallbackEl = document.getElementById("fallback");
 const labelsEl = document.getElementById("panel-labels");
 const gizmo = document.getElementById("axis-gizmo");
-const netCardEl = document.getElementById("net-card");
+const selectionCardEl = document.getElementById("selection-card");
 
 const state = {
   mode: "3d",
@@ -62,7 +62,6 @@ const compareAnimation = {
   started: 0,
   from: new Map(),
   current: new Map(),
-  labels: [],
 };
 let gizmoHits = [];
 
@@ -366,7 +365,6 @@ function updateCompareLayout(now) {
   if (state.mode !== "layer") {
     compareAnimation.key = "3d";
     compareAnimation.current.clear();
-    compareAnimation.labels = [];
     return new Map();
   }
   const selected = scene.copperLayers.filter((layer) => state.compareLayers.has(Number(layer.id)));
@@ -402,11 +400,6 @@ function updateCompareLayout(now) {
     compareAnimation.key = key;
     compareAnimation.started = now;
     compareAnimation.from = new Map(compareAnimation.current);
-    compareAnimation.labels = targets.map((item) => ({
-      name: item.layer.name,
-      left: `${(item.column / columns) * 100 + 1.2}%`,
-      top: `${(item.row / rows) * 100 + 1.6}%`,
-    }));
     const totalWidth = columns * boardWidth + (columns - 1) * (pitchX - boardWidth);
     const totalHeight = rows * boardHeight + (rows - 1) * (pitchY - boardHeight);
     camera.targetFocus = [
@@ -593,20 +586,22 @@ function renderSearch(query) {
 }
 
 function selectNet(netId, shouldFrame) {
+  if (shouldFrame) state.selectionAnchor = null;
   state.activeNetId = netId;
   state.selectedFeatureId = 0;
   const net = scene.nets.find((item) => Number(item.id) === netId);
   selectionEl.textContent = JSON.stringify(net || {}, null, 2);
-  updateNetCard();
+  updateSelectionCard();
   if (shouldFrame && net?.boundsMm) camera.frame(runtimeBounds(net.boundsMm));
 }
 
 function selectFeature(featureId, shouldFrame = false) {
   const feature = scene.features.get(featureId);
+  if (shouldFrame) state.selectionAnchor = null;
   state.selectedFeatureId = featureId;
   state.activeNetId = Number(feature?.netId || 0);
   selectionEl.textContent = feature ? JSON.stringify(feature, null, 2) : "No object selected";
-  updateNetCard();
+  updateSelectionCard();
   if (shouldFrame && feature?.bounds) camera.frame(feature.bounds);
 }
 
@@ -616,54 +611,109 @@ function clearSelection() {
   state.selectionAnchor = null;
   state.isolateNet = false;
   selectionEl.textContent = "No object selected";
-  updateNetCard();
+  updateSelectionCard();
 }
 
-function updateNetCard() {
-  if (!state.activeNetId) {
-    netCardEl.hidden = true;
-    netCardEl.innerHTML = "";
-    return;
-  }
-  const net = scene.nets.find((item) => Number(item.id) === state.activeNetId);
-  if (!net) {
-    netCardEl.hidden = true;
-    netCardEl.innerHTML = "";
-    return;
-  }
+function selectionProperties(items) {
+  return `<div class="selection-properties">${items.map(([label, value]) => `
+    <div class="selection-property">
+      <small>${escapeHtml(label)}</small>
+      <strong title="${escapeHtml(String(value))}">${escapeHtml(String(value))}</strong>
+    </div>`).join("")}</div>`;
+}
+
+function selectionHeader(type, title, accent) {
+  return `
+    <div class="selection-card-head">
+      <span class="selection-card-accent" style="background:${accent}"></span>
+      <div class="selection-card-title"><small>${escapeHtml(type)}</small><strong>${escapeHtml(title)}</strong></div>
+      <button class="selection-card-close" type="button" aria-label="Clear selection">&times;</button>
+    </div>`;
+}
+
+function netSelectionContent(net) {
   const details = topology.net_details?.[net.uid] || {};
   const terminals = details.terminals || [];
   const metrics = net.metrics || {};
-  netCardEl.innerHTML = `
-    <div class="net-card-head">
-      <span class="net-card-swatch"></span>
-      <div><small>Selected net</small><strong>${escapeHtml(net.name)}</strong></div>
-      <button type="button" aria-label="Clear selected net">×</button>
-    </div>
-    <div class="net-card-meta">
-      <span>${escapeHtml(net.netClass || "Default")}</span>
-      <span>${Number(metrics.traceLengthMm || 0).toFixed(2)} mm</span>
-      <span>${escapeHtml((metrics.layers || []).join(" · ") || "No layer data")}</span>
-    </div>
-    <div class="net-card-endpoints">
-      ${terminals.slice(0, 10).map((terminal) => `
-        <span><b>${escapeHtml(terminal.designator || "?")}</b> pin ${escapeHtml(terminal.pin || "?")}
-          ${terminal.value ? `<small>${escapeHtml(terminal.value)}</small>` : ""}
-        </span>`).join("")}
-      ${terminals.length > 10 ? `<span class="endpoint-more">+${terminals.length - 10} more</span>` : ""}
+  const endpointRows = terminals.length
+    ? terminals.slice(0, 12).map((terminal) => `
+      <div class="selection-row">
+        <span><strong>${escapeHtml(terminal.designator || "?")}</strong></span>
+        <span>Pin ${escapeHtml(terminal.pin || "?")}</span>
+        <span title="${escapeHtml(terminal.value || "")}">${escapeHtml(terminal.value || "Component")}</span>
+      </div>`).join("")
+    : `<div class="selection-empty">No connected pin metadata is available.</div>`;
+  return `
+    ${selectionHeader("Net", net.name, "#18ef52")}
+    ${selectionProperties([
+      ["Class", net.netClass || "Default"],
+      ["Length", `${Number(metrics.traceLengthMm || 0).toFixed(2)} mm`],
+      ["Layers", (metrics.layers || []).join(", ") || "Unknown"],
+    ])}
+    <div class="selection-section">
+      <span class="selection-section-title">Connected pins</span>
+      <div class="selection-table">
+        ${endpointRows}
+        ${terminals.length > 12 ? `<div class="selection-empty">${terminals.length - 12} additional pins</div>` : ""}
+      </div>
     </div>`;
-  netCardEl.hidden = false;
+}
+
+function componentSelectionContent(component) {
+  const meshes = component.meshNames || [];
+  return `
+    ${selectionHeader("Component", component.designator || "Unknown", "#3b82f6")}
+    ${selectionProperties([
+      ["Value", component.value || "Not specified"],
+      ["Footprint", component.footprint || "Not specified"],
+      ["Models", meshes.length || 0],
+    ])}
+    <div class="selection-section">
+      <span class="selection-section-title">Component details</span>
+      <div class="selection-table">
+        <div class="selection-row">
+          <span><strong>Reference</strong></span>
+          <span>${escapeHtml(component.designator || "Unknown")}</span>
+          <span title="${escapeHtml(component.uid || "")}">${escapeHtml(component.uid || "No source UID")}</span>
+        </div>
+        <div class="selection-row">
+          <span><strong>Geometry</strong></span>
+          <span>${meshes.length} ${meshes.length === 1 ? "mesh" : "meshes"}</span>
+          <span title="${escapeHtml(meshes.join(", "))}">${escapeHtml(meshes.join(", ") || "No named model nodes")}</span>
+        </div>
+      </div>
+    </div>`;
+}
+
+function updateSelectionCard() {
+  const feature = scene.features.get(state.selectedFeatureId);
+  const component = feature?.kind === "component" ? feature : null;
+  const net = state.activeNetId
+    ? scene.nets.find((item) => Number(item.id) === state.activeNetId)
+    : null;
+  if (!component && !net) {
+    selectionCardEl.hidden = true;
+    selectionCardEl.innerHTML = "";
+    return;
+  }
+  selectionCardEl.innerHTML = `
+    ${component ? componentSelectionContent(component) : netSelectionContent(net)}
+    <div class="selection-card-actions">
+      <button type="button" data-action="frame">Frame selection</button>
+    </div>`;
+  selectionCardEl.hidden = false;
   const anchor = state.selectionAnchor;
   if (anchor) {
-    const maxLeft = Math.max(16, canvas.clientWidth - 350);
-    const maxTop = Math.max(16, canvas.clientHeight - 210);
-    netCardEl.style.left = `${clamp(anchor.x + 18, 16, maxLeft)}px`;
-    netCardEl.style.top = `${clamp(anchor.y + 18, 16, maxTop)}px`;
+    const maxLeft = Math.max(16, canvas.clientWidth - 380);
+    const maxTop = Math.max(16, canvas.clientHeight - 330);
+    selectionCardEl.style.left = `${clamp(anchor.x + 18, 16, maxLeft)}px`;
+    selectionCardEl.style.top = `${clamp(anchor.y + 18, 16, maxTop)}px`;
   } else {
-    netCardEl.style.left = "20px";
-    netCardEl.style.top = "20px";
+    selectionCardEl.style.left = "20px";
+    selectionCardEl.style.top = "20px";
   }
-  netCardEl.querySelector("button").addEventListener("click", clearSelection);
+  selectionCardEl.querySelector(".selection-card-close").addEventListener("click", clearSelection);
+  selectionCardEl.querySelector("[data-action=frame]").addEventListener("click", frameSelection);
 }
 
 function frameSelection() {
@@ -922,7 +972,7 @@ function updateDiagnostics(now) {
     ["Resident tiles", scene.loaded.size],
     ["Triangles", Math.round(state.triangles).toLocaleString()],
     ["Downloaded", `${(state.loadedBytes / 1048576).toFixed(1)} MB`],
-    ["Active net", scene.nets.find((net) => Number(net.id) === state.activeNetId)?.name || "—"],
+    ["Active net", scene.nets.find((net) => Number(net.id) === state.activeNetId)?.name || "-"],
     ["FPS", state.fps.toFixed(1)],
   ].map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
 }
