@@ -10,6 +10,7 @@ from .exporter import export_viewer_html
 from .kicad_cli_export import export_project_geometry
 from .pcb_geometry import extract_pad_holes
 from .pcb_extract import extract_pcb_metadata
+from .schematic_scene import build_schematic_scene
 from .schematic_world import build_schematic_world
 from .semantic_gltf import build_semantic_gltf_scene
 
@@ -87,6 +88,12 @@ def cmd_from_project(args: argparse.Namespace) -> None:
             args.output,
         )
         semantic_geometry["assets"]["schematic_manifest"] = semantic_geometry["schematic_world"]["path"]
+        semantic_geometry["schematic_scene"] = build_schematic_scene(
+            design,
+            design_payload,
+            args.output,
+        )
+        semantic_geometry["assets"]["schematic_native_manifest"] = semantic_geometry["schematic_scene"]["path"]
     except Exception as exc:
         print(f"error: semantic PCB geometry export failed for {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(3)
@@ -112,6 +119,7 @@ def cmd_schematic_world(args: argparse.Namespace) -> None:
         design = KiCadDesign.from_project_file(project_file)
         design_payload = design.to_json(include_indexes=True)
         schematic_world = build_schematic_world(design, design_payload, output_dir)
+        schematic_scene = build_schematic_scene(design, design_payload, output_dir)
     except Exception as exc:
         print(f"error: schematic world export failed for {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(3)
@@ -119,7 +127,9 @@ def cmd_schematic_world(args: argparse.Namespace) -> None:
     topology = json.loads(topology_path.read_text(encoding="utf-8"))
     semantic_geometry = json.loads(semantic_geometry_path.read_text(encoding="utf-8"))
     semantic_geometry["schematic_world"] = schematic_world
+    semantic_geometry["schematic_scene"] = schematic_scene
     semantic_geometry.setdefault("assets", {})["schematic_manifest"] = schematic_world["path"]
+    semantic_geometry.setdefault("assets", {})["schematic_native_manifest"] = schematic_scene["path"]
     semantic_geometry_path.write_text(json.dumps(semantic_geometry, indent=2), encoding="utf-8")
     export_viewer_html(
         topology,

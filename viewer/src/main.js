@@ -154,7 +154,10 @@ async function boot() {
 }
 
 async function loadSchematicWorld() {
-  const path = semanticGeometry.assets?.schematic_manifest || semanticGeometry.schematic_world?.path;
+  const path = semanticGeometry.assets?.schematic_native_manifest
+    || semanticGeometry.schematic_scene?.path
+    || semanticGeometry.assets?.schematic_manifest
+    || semanticGeometry.schematic_world?.path;
   const tab = document.querySelector("[data-workspace=schematic]");
   if (!path) {
     tab.disabled = true;
@@ -528,7 +531,9 @@ function renderControls() {
 }
 
 function renderSchematicControls() {
-  viewerKindEl.textContent = "Schematic World A0";
+  viewerKindEl.textContent = schematicScene.manifest?.schema === "prism.schematic_scene_a0"
+    ? "Schematic Scene A0"
+    : "Schematic World A0";
   primaryHeadingEl.textContent = "Pages";
   primaryDescriptionEl.textContent = `${schematicScene.pages.length} hierarchy instances`;
   document.querySelector('[data-panel="search"] .section-heading span').textContent = "Pages, nets and components";
@@ -1089,11 +1094,11 @@ function bindSchematicInteractions() {
     state.schematicLastY = event.clientY;
     schematicRenderer.pan(dx, dy);
   });
-  schematicCanvas.addEventListener("pointerup", (event) => {
+  schematicCanvas.addEventListener("pointerup", async (event) => {
     state.schematicDragging = false;
     schematicCanvas.releasePointerCapture(event.pointerId);
     if (Math.hypot(event.clientX - state.schematicStartX, event.clientY - state.schematicStartY) < 3) {
-      const hit = schematicRenderer.hitFeature(event.clientX, event.clientY);
+      const hit = await schematicRenderer.pickFeature(event.clientX, event.clientY);
       if (hit) selectSchematicFeature(hit);
       else clearSchematicSelection();
     }
