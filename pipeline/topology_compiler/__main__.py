@@ -10,6 +10,7 @@ from .exporter import export_viewer_html
 from .kicad_cli_export import export_project_geometry
 from .pcb_geometry import extract_pad_holes
 from .pcb_extract import extract_pcb_metadata
+from .schematic_world import build_schematic_world
 from .semantic_gltf import build_semantic_gltf_scene
 
 
@@ -80,12 +81,52 @@ def cmd_from_project(args: argparse.Namespace) -> None:
             pad_holes=pad_holes,
         )
         semantic_geometry["assets"]["scene_manifest"] = "scene-gltf/scene.manifest.json"
+        semantic_geometry["schematic_world"] = build_schematic_world(
+            design,
+            design_payload,
+            args.output,
+        )
+        semantic_geometry["assets"]["schematic_manifest"] = semantic_geometry["schematic_world"]["path"]
     except Exception as exc:
         print(f"error: semantic PCB geometry export failed for {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(3)
     topology["design"].setdefault("assets", {})["semantic_geometry"] = "semantic_geometry.json"
     topology["design"]["assets"]["geometry_mode"] = "semantic-gltf"
     _write_outputs(topology, args.output, semantic_geometry)
+
+
+def cmd_schematic_world(args: argparse.Namespace) -> None:
+    project_file = args.project
+    output_dir = args.output
+    topology_path = output_dir / "topology.json"
+    semantic_geometry_path = output_dir / "semantic_geometry.json"
+    if not topology_path.exists() or not semantic_geometry_path.exists():
+        print(
+            f"error: {output_dir} must contain topology.json and semantic_geometry.json",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    try:
+        from kicad_monkey import KiCadDesign  # type: ignore
+
+        design = KiCadDesign.from_project_file(project_file)
+        design_payload = design.to_json(include_indexes=True)
+        schematic_world = build_schematic_world(design, design_payload, output_dir)
+    except Exception as exc:
+        print(f"error: schematic world export failed for {project_file}: {exc}", file=sys.stderr)
+        raise SystemExit(3)
+
+    topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    semantic_geometry = json.loads(semantic_geometry_path.read_text(encoding="utf-8"))
+    semantic_geometry["schematic_world"] = schematic_world
+    semantic_geometry.setdefault("assets", {})["schematic_manifest"] = schematic_world["path"]
+    semantic_geometry_path.write_text(json.dumps(semantic_geometry, indent=2), encoding="utf-8")
+    export_viewer_html(
+        topology,
+        output_dir / "viewer.html",
+        title=topology.get("design", {}).get("project", {}).get("filename", "KiCad 3D Viz"),
+        semantic_geometry=semantic_geometry,
+    )
 
 
 def main() -> None:
@@ -97,6 +138,14 @@ def main() -> None:
     from_project.add_argument("--output", type=Path, required=True)
     from_project.add_argument("--strict-components", action="store_true", help="Fail if component model export cannot complete")
     from_project.set_defaults(func=cmd_from_project)
+
+    schematic_world = sub.add_parser(
+        "schematic-world",
+        help="Add or refresh schematic-world assets in an existing visualizer bundle",
+    )
+    schematic_world.add_argument("project", type=Path)
+    schematic_world.add_argument("--output", type=Path, required=True)
+    schematic_world.set_defaults(func=cmd_schematic_world)
 
     args = parser.parse_args()
     args.func(args)

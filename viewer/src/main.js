@@ -2,12 +2,15 @@ import { CameraController } from "./camera.js";
 import { loadGltf } from "./gltf-loader.js";
 import { clamp } from "./math.js";
 import { Renderer } from "./renderer.js";
+import { SchematicWorldRenderer } from "./schematic-world-renderer.js";
 
 const topology = window.__TOPOLOGY__ || {};
 const semanticGeometry = window.__SEMANTIC_GEOMETRY__ || {};
 const appEl = document.getElementById("app");
 const canvas = document.getElementById("viewport");
+const schematicCanvas = document.getElementById("schematic-viewport");
 const statusEl = document.getElementById("status");
+const viewerKindEl = document.getElementById("viewer-kind");
 const selectionEl = document.getElementById("selection");
 const diagnosticsEl = document.getElementById("diagnostics");
 const layersEl = document.getElementById("layers");
@@ -15,10 +18,14 @@ const searchControlsEl = document.getElementById("search-controls");
 const viewControlsEl = document.getElementById("view-controls");
 const fallbackEl = document.getElementById("fallback");
 const labelsEl = document.getElementById("panel-labels");
+const schematicLabelsEl = document.getElementById("schematic-labels");
 const gizmo = document.getElementById("axis-gizmo");
 const selectionCardEl = document.getElementById("selection-card");
+const primaryHeadingEl = document.getElementById("primary-heading");
+const primaryDescriptionEl = document.getElementById("primary-description");
 
 const state = {
+  workspace: "pcb",
   mode: "3d",
   cameraTool: "orbit",
   compareLayers: new Set(),
@@ -42,6 +49,13 @@ const state = {
   frames: 0,
   fpsAt: performance.now(),
   activeTab: "layers",
+  selectedPageId: "",
+  selectedSchematicFeature: null,
+  schematicDragging: false,
+  schematicLastX: 0,
+  schematicLastY: 0,
+  schematicStartX: 0,
+  schematicStartY: 0,
 };
 
 const scene = {
@@ -63,9 +77,19 @@ const compareAnimation = {
   from: new Map(),
   current: new Map(),
 };
+const schematicScene = {
+  manifest: null,
+  manifestUrl: "",
+  pages: [],
+  byId: new Map(),
+  activeNetUid: "",
+  visiblePages: [],
+  fitted: false,
+};
 let gizmoHits = [];
 
 let renderer;
+let schematicRenderer;
 let camera;
 let panel;
 let compareOffsets = new Map();
@@ -117,12 +141,34 @@ async function boot() {
   camera = new CameraController(runtimeBoundsFromGltf(scene.manifest.bbox));
   renderer.setBarrels(scene.manifest.barrels || []);
   await Promise.all([first ? loadLayer(Number(first.id)) : Promise.resolve(), loadBoard()]);
+  await loadSchematicWorld();
   renderControls();
   bindInteractions();
+  bindSchematicInteractions();
+  bindWorkspaceTabs();
+  bindPanelTabs();
   statusEl.textContent = "WebGPU semantic glTF active";
   void loadComponents();
   void Promise.all(scene.copperLayers.slice(1).map((layer) => loadLayer(Number(layer.id))));
   requestAnimationFrame(frame);
+}
+
+async function loadSchematicWorld() {
+  const path = semanticGeometry.assets?.schematic_manifest || semanticGeometry.schematic_world?.path;
+  const tab = document.querySelector("[data-workspace=schematic]");
+  if (!path) {
+    tab.disabled = true;
+    tab.title = "No schematic world assets are available";
+    return;
+  }
+  schematicScene.manifestUrl = new URL(path, location.href).toString();
+  schematicRenderer = await SchematicWorldRenderer.create(schematicCanvas, schematicScene.manifestUrl);
+  schematicScene.manifest = schematicRenderer.manifest;
+  schematicScene.pages = schematicRenderer.pages;
+  schematicScene.byId = new Map(schematicScene.pages.map((page) => [page.id, page]));
+  state.selectedPageId = schematicScene.pages[0]?.id || "";
+  schematicRenderer.selectedPageId = state.selectedPageId;
+  void schematicRenderer.preloadOverview();
 }
 
 async function fetchJson(url) {
@@ -313,6 +359,13 @@ function hex(value) {
 }
 
 function frame(now) {
+  if (state.workspace === "schematic" && schematicRenderer) {
+    schematicScene.visiblePages = schematicRenderer.render();
+    updateSchematicLabels();
+    updateDiagnostics(now);
+    requestAnimationFrame(frame);
+    return;
+  }
   const dt = Math.min(0.05, (now - lastFrame) / 1000);
   lastFrame = now;
   camera.update(dt);
@@ -429,6 +482,15 @@ function updateCompareLayout(now) {
 }
 
 function renderControls() {
+  if (state.workspace === "schematic") {
+    renderSchematicControls();
+    return;
+  }
+  viewerKindEl.textContent = "Semantic GLTF A0";
+  primaryHeadingEl.textContent = "Layers";
+  primaryDescriptionEl.textContent = "Visibility and compare";
+  document.querySelector('[data-panel="search"] .section-heading span').textContent = "Nets, components and pins";
+  document.querySelector('[data-panel="view"] .section-heading span').textContent = "Camera and stackup";
   layersEl.innerHTML = `
     <div class="mode-toolbar">
       <button data-mode="layer">Layer Compare</button>
@@ -463,7 +525,175 @@ function renderControls() {
     </label>`;
   refreshControls();
   bindControlEvents();
-  bindPanelTabs();
+}
+
+function renderSchematicControls() {
+  viewerKindEl.textContent = "Schematic World A0";
+  primaryHeadingEl.textContent = "Pages";
+  primaryDescriptionEl.textContent = `${schematicScene.pages.length} hierarchy instances`;
+  document.querySelector('[data-panel="search"] .section-heading span').textContent = "Pages, nets and components";
+  document.querySelector('[data-panel="view"] .section-heading span').textContent = "World navigation";
+  layersEl.innerHTML = `
+    <div class="layer-presets">
+      <button data-page-action="world">Fit world</button>
+      <button data-page-action="parent">Parent</button>
+      <button data-page-action="previous">Previous</button>
+      <button data-page-action="next">Next</button>
+    </div>
+    <div class="page-list">${schematicScene.pages.map((page) => `
+      <button class="page-row ${page.id === state.selectedPageId ? "active" : ""}" data-page="${page.id}">
+        <span>${page.sheetNumber}</span>
+        <strong>${escapeHtml(page.name)}</strong>
+        <small>L${page.depth}</small>
+      </button>`).join("")}</div>`;
+  searchControlsEl.innerHTML = `
+    <label class="control-field"><span>Search</span>
+      <input id="entity-search" class="layer-select" type="search" placeholder="Page, net or component">
+      <div id="search-results" class="search-results"></div>
+    </label>
+    <div class="quick-actions">
+      <button id="frame-selection">Frame</button>
+      <button id="clear-selection">Clear</button>
+    </div>`;
+  viewControlsEl.innerHTML = `
+    <div class="toggle-list">
+      <label class="toggle-row"><input id="show-hierarchy" type="checkbox" checked><span>Hierarchy links</span></label>
+    </div>
+    <div class="selection-section">
+      <span class="selection-section-title">Navigation</span>
+      <div class="selection-table">
+        <div class="selection-row"><span><strong>Home</strong></span><span>World</span><span>Frame every page</span></div>
+        <div class="selection-row"><span><strong>[ / ]</strong></span><span>Pages</span><span>Previous or next instance</span></div>
+        <div class="selection-row"><span><strong>Alt+Up</strong></span><span>Parent</span><span>Move up hierarchy</span></div>
+      </div>
+    </div>`;
+  layersEl.querySelectorAll("[data-page]").forEach((button) => {
+    button.addEventListener("click", () => selectSchematicPage(button.dataset.page, true));
+  });
+  layersEl.querySelectorAll("[data-page-action]").forEach((button) => {
+    button.addEventListener("click", () => navigateSchematic(button.dataset.pageAction));
+  });
+  searchControlsEl.querySelector("#entity-search").addEventListener("input", (event) => {
+    renderSchematicSearch(event.target.value);
+  });
+  searchControlsEl.querySelector("#frame-selection").addEventListener("click", frameSchematicSelection);
+  searchControlsEl.querySelector("#clear-selection").addEventListener("click", clearSchematicSelection);
+  viewControlsEl.querySelector("#show-hierarchy").checked = schematicRenderer?.showHierarchy ?? true;
+  viewControlsEl.querySelector("#show-hierarchy").addEventListener("change", (event) => {
+    schematicRenderer.showHierarchy = event.target.checked;
+  });
+}
+
+function selectSchematicPage(pageId, shouldFrame) {
+  const page = schematicScene.byId.get(pageId);
+  if (!page || !schematicRenderer) return;
+  state.selectedPageId = page.id;
+  schematicRenderer.selectedPageId = page.id;
+  selectionEl.textContent = JSON.stringify(page, null, 2);
+  if (shouldFrame) schematicRenderer.framePage(page);
+  layersEl.querySelectorAll("[data-page]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.page === page.id);
+  });
+}
+
+function navigateSchematic(action) {
+  if (!schematicRenderer) return;
+  if (action === "world") {
+    schematicRenderer.frameWorld();
+    return;
+  }
+  const index = Math.max(0, schematicScene.pages.findIndex((page) => page.id === state.selectedPageId));
+  let target = null;
+  if (action === "previous") target = schematicScene.pages[(index - 1 + schematicScene.pages.length) % schematicScene.pages.length];
+  else if (action === "next") target = schematicScene.pages[(index + 1) % schematicScene.pages.length];
+  else if (action === "parent") target = schematicScene.byId.get(schematicScene.pages[index]?.parentId);
+  if (target) selectSchematicPage(target.id, true);
+}
+
+function renderSchematicSearch(query) {
+  const container = searchControlsEl.querySelector("#search-results");
+  const value = query.trim().toLowerCase();
+  if (!value) {
+    container.innerHTML = "";
+    return;
+  }
+  const pages = schematicScene.pages.filter((page) =>
+    `${page.name} ${page.sheetPath}`.toLowerCase().includes(value)).slice(0, 8);
+  const nets = scene.nets.filter((net) => String(net.name).toLowerCase().includes(value)).slice(0, 8);
+  container.innerHTML = [
+    ...pages.map((page) => `<button data-page="${page.id}"><b>${escapeHtml(page.name)}</b><span>Page ${page.sheetNumber}</span></button>`),
+    ...nets.map((net) => `<button data-schematic-net="${net.id}"><b>${escapeHtml(net.name)}</b><span>${(schematicScene.manifest.netToPages?.[net.uid] || []).length} pages</span></button>`),
+  ].join("");
+  container.querySelectorAll("[data-page]").forEach((button) => {
+    button.addEventListener("click", () => selectSchematicPage(button.dataset.page, true));
+  });
+  container.querySelectorAll("[data-schematic-net]").forEach((button) => {
+    button.addEventListener("click", () => selectSchematicNet(Number(button.dataset.schematicNet), true));
+  });
+}
+
+function selectSchematicNet(netId, shouldFrame) {
+  const net = scene.nets.find((item) => Number(item.id) === netId);
+  if (!net || !schematicRenderer) return;
+  state.activeNetId = netId;
+  state.selectedFeatureId = 0;
+  schematicScene.activeNetUid = net.uid;
+  schematicRenderer.activeNetUid = net.uid;
+  selectionEl.textContent = JSON.stringify(net, null, 2);
+  updateSelectionCard();
+  const pageIds = schematicScene.manifest.netToPages?.[net.uid] || [];
+  if (shouldFrame && pageIds.length) selectSchematicPage(pageIds[0], true);
+}
+
+function clearSchematicSelection() {
+  state.activeNetId = 0;
+  state.selectedFeatureId = 0;
+  state.selectedSchematicFeature = null;
+  schematicScene.activeNetUid = "";
+  if (schematicRenderer) schematicRenderer.activeNetUid = "";
+  selectionEl.textContent = "No object selected";
+  updateSelectionCard();
+}
+
+function frameSchematicSelection() {
+  const page = schematicScene.byId.get(state.selectedPageId);
+  if (page) schematicRenderer.framePage(page);
+  else schematicRenderer.frameWorld();
+}
+
+function selectSchematicFeature(hit) {
+  const { page, feature } = hit;
+  if (!feature) {
+    state.selectedSchematicFeature = null;
+    selectSchematicPage(page.id, false);
+    updateSelectionCard();
+    return;
+  }
+  state.selectedPageId = page.id;
+  schematicRenderer.selectedPageId = page.id;
+  state.selectedSchematicFeature = { ...feature, pageId: page.id };
+  state.selectionAnchor = null;
+
+  if (feature.netUid) {
+    const net = scene.nets.find((item) => item.uid === feature.netUid);
+    if (net) {
+      selectSchematicNet(Number(net.id), false);
+      state.selectedSchematicFeature = { ...feature, pageId: page.id };
+      return;
+    }
+  }
+  if (feature.reference) {
+    const component = scene.componentFeatures.get(feature.reference);
+    if (component) {
+      state.selectedSchematicFeature = null;
+      selectFeature(Number(component.featureId), false);
+      return;
+    }
+  }
+  state.activeNetId = 0;
+  state.selectedFeatureId = 0;
+  selectionEl.textContent = JSON.stringify({ page: page.name, ...feature }, null, 2);
+  updateSelectionCard();
 }
 
 function refreshControls() {
@@ -590,6 +820,10 @@ function selectNet(netId, shouldFrame) {
   state.activeNetId = netId;
   state.selectedFeatureId = 0;
   const net = scene.nets.find((item) => Number(item.id) === netId);
+  if (state.workspace === "schematic" && net && schematicRenderer) {
+    schematicScene.activeNetUid = net.uid;
+    schematicRenderer.activeNetUid = net.uid;
+  }
   selectionEl.textContent = JSON.stringify(net || {}, null, 2);
   updateSelectionCard();
   if (shouldFrame && net?.boundsMm) camera.frame(runtimeBounds(net.boundsMm));
@@ -608,8 +842,11 @@ function selectFeature(featureId, shouldFrame = false) {
 function clearSelection() {
   state.activeNetId = 0;
   state.selectedFeatureId = 0;
+  state.selectedSchematicFeature = null;
   state.selectionAnchor = null;
   state.isolateNet = false;
+  schematicScene.activeNetUid = "";
+  if (schematicRenderer) schematicRenderer.activeNetUid = "";
   selectionEl.textContent = "No object selected";
   updateSelectionCard();
 }
@@ -685,27 +922,58 @@ function componentSelectionContent(component) {
     </div>`;
 }
 
+function schematicFeatureSelectionContent(feature, page) {
+  return `
+    ${selectionHeader(
+      feature.kind.replaceAll("_", " "),
+      feature.reference || feature.text || feature.netName || "Schematic object",
+      "#3b82f6",
+    )}
+    ${selectionProperties([
+      ["Page", page?.name || "Unknown"],
+      ["Kind", feature.kind.replaceAll("_", " ")],
+      ["Net", feature.netName || "Not connected"],
+    ])}
+    <div class="selection-section">
+      <span class="selection-section-title">Source identity</span>
+      <div class="selection-table">
+        <div class="selection-row">
+          <span><strong>UUID</strong></span>
+          <span title="${escapeHtml(feature.uuid || "")}">${escapeHtml(feature.uuid || "-")}</span>
+          <span title="${escapeHtml(feature.objectId || "")}">${escapeHtml(feature.objectId || "No object ID")}</span>
+        </div>
+      </div>
+    </div>`;
+}
+
 function updateSelectionCard() {
   const feature = scene.features.get(state.selectedFeatureId);
   const component = feature?.kind === "component" ? feature : null;
+  const schematicFeature = state.workspace === "schematic" ? state.selectedSchematicFeature : null;
+  const schematicPage = schematicFeature ? schematicScene.byId.get(schematicFeature.pageId) : null;
   const net = state.activeNetId
     ? scene.nets.find((item) => Number(item.id) === state.activeNetId)
     : null;
-  if (!component && !net) {
+  if (!component && !net && !schematicFeature) {
     selectionCardEl.hidden = true;
     selectionCardEl.innerHTML = "";
     return;
   }
   selectionCardEl.innerHTML = `
-    ${component ? componentSelectionContent(component) : netSelectionContent(net)}
+    ${component
+      ? componentSelectionContent(component)
+      : net
+        ? netSelectionContent(net)
+        : schematicFeatureSelectionContent(schematicFeature, schematicPage)}
     <div class="selection-card-actions">
       <button type="button" data-action="frame">Frame selection</button>
     </div>`;
   selectionCardEl.hidden = false;
+  const activeCanvas = state.workspace === "schematic" ? schematicCanvas : canvas;
   const anchor = state.selectionAnchor;
   if (anchor) {
-    const maxLeft = Math.max(16, canvas.clientWidth - 380);
-    const maxTop = Math.max(16, canvas.clientHeight - 330);
+    const maxLeft = Math.max(16, activeCanvas.clientWidth - 380);
+    const maxTop = Math.max(16, activeCanvas.clientHeight - 330);
     selectionCardEl.style.left = `${clamp(anchor.x + 18, 16, maxLeft)}px`;
     selectionCardEl.style.top = `${clamp(anchor.y + 18, 16, maxTop)}px`;
   } else {
@@ -717,6 +985,10 @@ function updateSelectionCard() {
 }
 
 function frameSelection() {
+  if (state.workspace === "schematic") {
+    frameSchematicSelection();
+    return;
+  }
   const feature = scene.features.get(state.selectedFeatureId);
   if (feature?.bounds) camera.frame(feature.bounds);
   else {
@@ -773,6 +1045,69 @@ function bindInteractions() {
   window.addEventListener("keydown", handleKey);
 }
 
+function bindWorkspaceTabs() {
+  document.querySelectorAll("[data-workspace]").forEach((button) => {
+    button.addEventListener("click", () => switchWorkspace(button.dataset.workspace));
+  });
+}
+
+function switchWorkspace(workspace) {
+  if (workspace === "schematic" && !schematicRenderer) return;
+  state.workspace = workspace;
+  const schematic = workspace === "schematic";
+  canvas.hidden = schematic;
+  schematicCanvas.hidden = !schematic;
+  gizmo.hidden = schematic;
+  labelsEl.hidden = schematic;
+  schematicLabelsEl.hidden = !schematic;
+  document.querySelectorAll("[data-workspace]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.workspace === workspace);
+  });
+  statusEl.textContent = schematic ? "WebGPU schematic world active" : "WebGPU semantic glTF active";
+  if (schematic && !schematicScene.fitted) {
+    schematicRenderer.resize();
+    schematicRenderer.frameWorld();
+    schematicScene.fitted = true;
+  }
+  renderControls();
+}
+
+function bindSchematicInteractions() {
+  schematicCanvas.addEventListener("pointerdown", (event) => {
+    state.schematicDragging = true;
+    state.schematicLastX = event.clientX;
+    state.schematicLastY = event.clientY;
+    state.schematicStartX = event.clientX;
+    state.schematicStartY = event.clientY;
+    schematicCanvas.setPointerCapture(event.pointerId);
+  });
+  schematicCanvas.addEventListener("pointermove", (event) => {
+    if (!state.schematicDragging || !schematicRenderer) return;
+    const dx = event.clientX - state.schematicLastX;
+    const dy = event.clientY - state.schematicLastY;
+    state.schematicLastX = event.clientX;
+    state.schematicLastY = event.clientY;
+    schematicRenderer.pan(dx, dy);
+  });
+  schematicCanvas.addEventListener("pointerup", (event) => {
+    state.schematicDragging = false;
+    schematicCanvas.releasePointerCapture(event.pointerId);
+    if (Math.hypot(event.clientX - state.schematicStartX, event.clientY - state.schematicStartY) < 3) {
+      const hit = schematicRenderer.hitFeature(event.clientX, event.clientY);
+      if (hit) selectSchematicFeature(hit);
+      else clearSchematicSelection();
+    }
+  });
+  schematicCanvas.addEventListener("dblclick", (event) => {
+    const page = schematicRenderer.hitPage(event.clientX, event.clientY);
+    if (page) selectSchematicPage(page.id, true);
+  });
+  schematicCanvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    schematicRenderer.zoom(event.deltaY, event.clientX, event.clientY);
+  }, { passive: false });
+}
+
 async function pickAt(event) {
   if (!panel) return;
   const rect = canvas.getBoundingClientRect();
@@ -805,6 +1140,24 @@ function handleKey(event) {
     return;
   }
   const key = event.key.toLowerCase();
+  if (state.workspace === "schematic") {
+    if (key === "/") {
+      event.preventDefault();
+      openTab("search");
+      searchControlsEl.querySelector("#entity-search")?.focus();
+    } else if (key === "escape") clearSchematicSelection();
+    else if (key === "home") schematicRenderer?.frameWorld();
+    else if (key === "[") navigateSchematic("previous");
+    else if (key === "]") navigateSchematic("next");
+    else if (event.altKey && key === "arrowup") navigateSchematic("parent");
+    else if (event.key.startsWith("Arrow")) {
+      event.preventDefault();
+      const dx = event.key === "ArrowRight" ? 32 : event.key === "ArrowLeft" ? -32 : 0;
+      const dy = event.key === "ArrowDown" ? 32 : event.key === "ArrowUp" ? -32 : 0;
+      schematicRenderer?.pan(dx, dy);
+    }
+    return;
+  }
   if (key === "/") {
     event.preventDefault();
     openTab("search");
@@ -934,6 +1287,28 @@ function updateLayerLabels() {
     }).join("");
 }
 
+function updateSchematicLabels() {
+  if (state.workspace !== "schematic" || !schematicRenderer) {
+    schematicLabelsEl.innerHTML = "";
+    return;
+  }
+  schematicLabelsEl.innerHTML = schematicScene.visiblePages
+    .filter((page) => schematicRenderer.pagePixelWidth(page) > 120)
+    .map((page) => {
+      const [left, top] = schematicRenderer.worldToScreen(
+        page.worldX + 8 * schematicRenderer.scale,
+        page.worldY - 6 * schematicRenderer.scale,
+      );
+      const selected = page.id === state.selectedPageId;
+      const containsNet = schematicScene.activeNetUid && page.netUids.includes(schematicScene.activeNetUid);
+      const accent = containsNet ? "#18ef52" : selected ? "#3b82f6" : "#4b8de8";
+      return `<div class="schematic-page-label" style="left:${left}px;top:${top}px;border-left-color:${accent}">
+        <strong>${escapeHtml(page.name)}</strong>
+        <small>Page ${page.sheetNumber} &middot; ${page.featureCount.toLocaleString()} features</small>
+      </div>`;
+    }).join("");
+}
+
 function projectPoint(point, matrix, width, height) {
   const x = point[0];
   const y = point[1];
@@ -965,7 +1340,18 @@ function updateDiagnostics(now) {
   state.fps = state.frames * 1000 / (now - state.fpsAt);
   state.frames = 0;
   state.fpsAt = now;
-  diagnosticsEl.innerHTML = [
+  const rows = state.workspace === "schematic" && schematicRenderer
+    ? [
+      ["Renderer", "WebGPU schematic world"],
+      ["Pages", schematicScene.pages.length],
+      ["Visible pages", schematicScene.visiblePages.length],
+      ["Hierarchy links", schematicScene.manifest.edges?.length || 0],
+      ["Selected page", schematicScene.byId.get(state.selectedPageId)?.name || "-"],
+      ["Active net", scene.nets.find((net) => net.uid === schematicScene.activeNetUid)?.name || "-"],
+      ["Downloaded", `${(schematicRenderer.downloadedBytes / 1048576).toFixed(1)} MB`],
+      ["FPS", state.fps.toFixed(1)],
+    ]
+    : [
     ["Renderer", "WebGPU semantic glTF"],
     ["Mode", state.mode === "3d" ? "3D" : "Layer Compare"],
     ["Visible layers", state.mode === "3d" ? state.visible3dLayers.size : state.compareLayers.size],
@@ -974,7 +1360,8 @@ function updateDiagnostics(now) {
     ["Downloaded", `${(state.loadedBytes / 1048576).toFixed(1)} MB`],
     ["Active net", scene.nets.find((net) => Number(net.id) === state.activeNetId)?.name || "-"],
     ["FPS", state.fps.toFixed(1)],
-  ].map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
+  ];
+  diagnosticsEl.innerHTML = rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
 }
 
 function rgbCss(color) {
