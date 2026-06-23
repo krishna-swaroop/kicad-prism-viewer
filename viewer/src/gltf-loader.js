@@ -60,8 +60,10 @@ export async function loadGltf(url, options = {}) {
           objectFeatureId,
           indices,
           designator,
+          nodeName: node.getName(),
           material: material
             ? {
+                name: material.getName(),
                 baseColor: material.getBaseColorFactor(),
                 metallic: material.getMetallicFactor(),
                 roughness: material.getRoughnessFactor(),

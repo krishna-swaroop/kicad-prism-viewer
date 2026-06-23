@@ -17,6 +17,28 @@ def _read_viewer_sources() -> dict[str, str]:
     }
 
 
+def _compact_net_details(topology: dict[str, Any]) -> dict[str, Any]:
+    components = {
+        str(component.get("uid") or ""): component
+        for component in topology.get("components", [])
+    }
+    details: dict[str, dict[str, Any]] = {}
+    for terminal in topology.get("terminals", []):
+        net_uid = str(terminal.get("net_uid") or "")
+        if not net_uid:
+            continue
+        component = components.get(str(terminal.get("component_uid") or ""), {})
+        endpoint = {
+            "designator": str(terminal.get("designator") or component.get("designator") or ""),
+            "pin": str(terminal.get("pin") or ""),
+            "value": str(component.get("value") or ""),
+        }
+        terminals = details.setdefault(net_uid, {"terminals": []})["terminals"]
+        if endpoint not in terminals:
+            terminals.append(endpoint)
+    return details
+
+
 def export_viewer_html(
     topology: dict[str, Any],
     output_path: Path,
@@ -33,6 +55,7 @@ def export_viewer_html(
             "schema": topology.get("schema"),
             "design": topology.get("design", {}),
             "board": topology.get("board", {}),
+            "net_details": _compact_net_details(topology),
         }
         embedded_geometry = {
             "schema": semantic_geometry.get("schema"),

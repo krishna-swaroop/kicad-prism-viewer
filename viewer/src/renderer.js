@@ -1,6 +1,6 @@
 const VERTEX_STRIDE = 40;
 const DRAW_UNIFORM_SIZE = 256;
-const GLOBAL_UNIFORM_SIZE = 96;
+const GLOBAL_UNIFORM_SIZE = 112;
 
 const MAIN_SHADER = `
 struct Globals {
@@ -9,6 +9,10 @@ struct Globals {
   selectedLayer: u32,
   time: f32,
   hasHighlight: f32,
+  selectedFeature: u32,
+  padding0: u32,
+  padding1: u32,
+  padding2: u32,
   lightDirection: vec4f,
 };
 struct Draw {
@@ -55,13 +59,19 @@ fn aces(color: vec3f) -> vec3f {
 @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
   let kind = u32(draw.flags.x);
   let copper = kind == 1u;
+  let component = kind == 2u;
   let selected = globals.activeNet != 0u && input.netId == globals.activeNet;
+  let selectedComponent = component && globals.selectedFeature != 0u && input.objectId == globals.selectedFeature;
   var base = draw.color.rgb;
   if (selected && copper) {
     let pulse = 0.88 + 0.12 * sin(globals.time * 3.2);
     base = vec3f(0.08, 1.0, 0.2) * pulse;
   } else if (globals.hasHighlight > 0.5 && copper) {
     base = mix(base, vec3f(0.12, 0.14, 0.17), 0.58);
+  }
+  if (selectedComponent) {
+    let pulse = 0.84 + 0.16 * sin(globals.time * 3.6);
+    base = mix(base, vec3f(0.15, 0.72, 1.0) * pulse, 0.72);
   }
   if (draw.flags.z > 0.5 && copper && !selected) { discard; }
   let normal = normalize(input.normal);
@@ -73,8 +83,7 @@ fn aces(color: vec3f) -> vec3f {
   let specular = pow(max(dot(normal, normalize(light + vec3f(0.3, -0.4, 0.85))), 0.0), mix(96.0, 6.0, roughness));
   let shaded = base * (hemi + diffuse * 0.72) + mix(vec3f(0.04), base, metallic) * specular * 0.5;
   var lit = select(shaded, base, draw.flags.w > 0.5);
-  lit *= draw.flags.y;
-  return vec4f(aces(lit), 1.0);
+  return vec4f(aces(lit), draw.flags.y);
 }
 `;
 
@@ -85,6 +94,10 @@ struct Globals {
   selectedLayer: u32,
   time: f32,
   hasHighlight: f32,
+  selectedFeature: u32,
+  padding0: u32,
+  padding1: u32,
+  padding2: u32,
   lightDirection: vec4f,
 };
 struct Draw { color: vec4f, material: vec4f, offset: vec4f, flags: vec4f };
@@ -118,6 +131,10 @@ struct Globals {
   selectedLayer: u32,
   time: f32,
   hasHighlight: f32,
+  selectedFeature: u32,
+  padding0: u32,
+  padding1: u32,
+  padding2: u32,
   lightDirection: vec4f,
 };
 struct Draw { color: vec4f, material: vec4f, offset: vec4f, flags: vec4f };
@@ -179,6 +196,10 @@ struct Globals {
   selectedLayer: u32,
   time: f32,
   hasHighlight: f32,
+  selectedFeature: u32,
+  padding0: u32,
+  padding1: u32,
+  padding2: u32,
   lightDirection: vec4f,
 };
 struct Draw { color: vec4f, material: vec4f, offset: vec4f, flags: vec4f };
@@ -276,7 +297,17 @@ export class Renderer {
     return this.device.createRenderPipeline({
       layout,
       vertex: { module, entryPoint: "vs", buffers },
-      fragment: { module, entryPoint: "fs", targets: [{ format }] },
+      fragment: {
+        module,
+        entryPoint: "fs",
+        targets: [{
+          format,
+          blend: format === "r32uint" ? undefined : {
+            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+          },
+        }],
+      },
       primitive: { topology: "triangle-list", cullMode: "none" },
       depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
       multisample: { count: 1 },
@@ -310,7 +341,17 @@ export class Renderer {
           },
         ],
       },
-      fragment: { module, entryPoint: "fs", targets: [{ format }] },
+      fragment: {
+        module,
+        entryPoint: "fs",
+        targets: [{
+          format,
+          blend: format === "r32uint" ? undefined : {
+            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+          },
+        }],
+      },
       primitive: { topology: "triangle-list", cullMode: "none" },
       depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
     });
@@ -422,6 +463,7 @@ export class Renderer {
   render({
     panels,
     activeNetId,
+    selectedFeatureId,
     time,
     layerOffsets,
     visibleLayers,
@@ -450,7 +492,7 @@ export class Renderer {
       const viewport = clampViewport(panel.viewport, this.canvas.width, this.canvas.height);
       pass.setViewport(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
       pass.setScissorRect(viewport.x, viewport.y, viewport.width, viewport.height);
-      this.writeGlobals(panel.matrix, activeNetId, panel.layerId, time);
+      this.writeGlobals(panel.matrix, activeNetId, panel.layerId, time, selectedFeatureId);
       const visibleEntries = this.entries.filter((entry) =>
         this.visible(entry, panel.layerId, visibleLayers, showBoard, showComponents, componentOpacity, compareMode));
       for (const entry of visibleEntries) {
@@ -496,7 +538,7 @@ export class Renderer {
     return panelLayer ? entry.layerId === panelLayer : visibleLayers.has(entry.layerId);
   }
 
-  writeGlobals(matrix, activeNetId, selectedLayer, time) {
+  writeGlobals(matrix, activeNetId, selectedLayer, time, selectedFeatureId = 0) {
     const data = new ArrayBuffer(GLOBAL_UNIFORM_SIZE);
     new Float32Array(data, 0, 16).set(matrix);
     const view = new DataView(data);
@@ -504,7 +546,8 @@ export class Renderer {
     view.setUint32(68, selectedLayer || 0, true);
     view.setFloat32(72, time, true);
     view.setFloat32(76, activeNetId ? 1 : 0, true);
-    new Float32Array(data, 80, 4).set([0.35, -0.5, 0.8, 0]);
+    view.setUint32(80, selectedFeatureId || 0, true);
+    new Float32Array(data, 96, 4).set([0.35, -0.5, 0.8, 0]);
     this.device.queue.writeBuffer(this.globalBuffer, 0, data);
   }
 
@@ -528,7 +571,11 @@ export class Renderer {
       0,
     ], 8);
     const opacity = entry.kind === "component" ? componentOpacity : entry.kind === "board" ? boardOpacity : 1;
-    data.set([entry.kind === "copper" ? 1 : 0, opacity, isolateNet ? 1 : 0, compareMode ? 1 : 0], 12);
+    const kind = entry.kind === "copper" ? 1 : entry.kind === "component" ? 2 : 0;
+    const boardOpacityValue = entry.kind === "board" && entry.boardRole === "substrate"
+      ? boardOpacity
+      : opacity;
+    data.set([kind, boardOpacityValue, isolateNet ? 1 : 0, compareMode ? 1 : 0], 12);
     this.device.queue.writeBuffer(entry.drawBuffer, 0, data);
   }
 
@@ -570,7 +617,13 @@ export class Renderer {
     this.resize();
     const pixelX = Math.max(0, Math.min(this.canvas.width - 1, Math.floor(x)));
     const pixelY = Math.max(0, Math.min(this.canvas.height - 1, Math.floor(y)));
-    this.writeGlobals(panel.matrix, options.activeNetId, panel.layerId, performance.now() / 1000);
+    this.writeGlobals(
+      panel.matrix,
+      options.activeNetId,
+      panel.layerId,
+      performance.now() / 1000,
+      options.selectedFeatureId,
+    );
     this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, new Float32Array(options.layerOffsets));
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({

@@ -68,15 +68,15 @@ export class CameraController {
       : perspective(
           this.fov,
           aspect,
-          Math.max(0.0001, this.sceneRadius / 10000),
-          this.sceneRadius * 100,
+          Math.max(this.sceneRadius * 0.0005, this.distance - this.sceneRadius * 3.5),
+          this.distance + this.sceneRadius * 4.5,
         );
     return mat4Multiply(projection, view);
   }
 
   orbit(dx, dy) {
     this.targetAzimuth -= dx * 0.006;
-    this.targetPolar = clamp(this.targetPolar + dy * 0.006, 0.015, Math.PI - 0.015);
+    this.targetPolar = clamp(this.targetPolar - dy * 0.006, 0.015, Math.PI - 0.015);
   }
 
   pan(dx, dy, viewportHeight, orthographicMode = false) {

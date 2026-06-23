@@ -72,20 +72,136 @@ input {
   font-size: 11px;
   font-weight: 650;
   backdrop-filter: blur(8px);
+  transform: translate(10px, -50%);
+  transition: left 60ms linear, top 60ms linear;
 }
 
 #axis-gizmo {
   position: absolute;
   left: 14px;
   bottom: 14px;
-  width: 76px;
-  height: 76px;
+  width: 104px;
+  height: 104px;
   cursor: pointer;
-  border: 1px solid rgba(20, 30, 45, 0.14);
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.82);
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.09);
-  backdrop-filter: blur(10px);
+  border: 0;
+  background: transparent;
+  filter: drop-shadow(0 4px 8px rgba(15, 23, 42, 0.18));
+}
+
+#net-card {
+  position: absolute;
+  z-index: 4;
+  width: min(330px, calc(100% - 32px));
+  padding: 13px;
+  border: 1px solid rgba(44, 61, 83, 0.22);
+  border-radius: 7px;
+  background: rgba(250, 252, 253, 0.94);
+  box-shadow: 0 16px 42px rgba(15, 23, 42, 0.18);
+  color: #172033;
+  backdrop-filter: blur(14px);
+}
+
+#net-card[hidden] {
+  display: none;
+}
+
+.net-card-head {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) 26px;
+  align-items: center;
+  gap: 10px;
+}
+
+.net-card-swatch {
+  width: 8px;
+  height: 32px;
+  border-radius: 3px;
+  background: #18ef52;
+  box-shadow: 0 0 12px rgba(24, 239, 82, 0.38);
+}
+
+.net-card-head div {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.net-card-head small {
+  color: #69758a;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.net-card-head strong {
+  overflow: hidden;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.net-card-head button {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #657086;
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.net-card-head button:hover {
+  background: #e8edf3;
+  color: #172033;
+}
+
+.net-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 10px 0;
+}
+
+.net-card-meta span {
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: #e9eef4;
+  color: #4e5b70;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.net-card-endpoints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-height: 92px;
+  overflow: auto;
+}
+
+.net-card-endpoints > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  padding: 4px 6px;
+  border: 1px solid #d9e0e9;
+  border-radius: 4px;
+  background: #fff;
+  color: #4d596c;
+  font-size: 10px;
+}
+
+.net-card-endpoints small {
+  color: #8791a2;
+}
+
+.net-card-endpoints .endpoint-more {
+  border-style: dashed;
+  background: transparent;
 }
 
 #fallback {

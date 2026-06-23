@@ -16,6 +16,7 @@ const viewControlsEl = document.getElementById("view-controls");
 const fallbackEl = document.getElementById("fallback");
 const labelsEl = document.getElementById("panel-labels");
 const gizmo = document.getElementById("axis-gizmo");
+const netCardEl = document.getElementById("net-card");
 
 const state = {
   mode: "3d",
@@ -24,6 +25,7 @@ const state = {
   visible3dLayers: new Set(),
   activeNetId: 0,
   selectedFeatureId: 0,
+  selectionAnchor: null,
   showBoard: true,
   showComponents: true,
   isolateNet: false,
@@ -62,6 +64,7 @@ const compareAnimation = {
   current: new Map(),
   labels: [],
 };
+let gizmoHits = [];
 
 let renderer;
 let camera;
@@ -166,14 +169,22 @@ async function loadBoard() {
   if (!path) return;
   const loaded = await loadGltf(new URL(path, location.href).toString(), { defaultFeatureId: 0 });
   state.loadedBytes += loaded.byteLength;
-  for (const primitive of mergePrimitivesByMaterial(loaded.primitives)) {
+  for (const primitive of mergePrimitivesByMaterial(loaded.primitives, boardRole)) {
     renderer.addPrimitive(primitive, {
       kind: "board",
+      boardRole: primitive.groupKey,
       layerId: 0,
       material: primitive.material,
       color: primitive.material.baseColor,
     });
   }
+}
+
+function boardRole(primitive) {
+  const name = String(primitive.nodeName || "").toLowerCase();
+  if (name.includes("_pad")) return "pad";
+  if (name.includes("_silkscreen")) return "silkscreen";
+  return "substrate";
 }
 
 async function loadComponents() {
@@ -197,10 +208,11 @@ async function loadComponents() {
   }
 }
 
-function mergePrimitivesByMaterial(primitives) {
+function mergePrimitivesByMaterial(primitives, classifier = () => "") {
   const groups = new Map();
   for (const primitive of primitives) {
-    const key = JSON.stringify(primitive.material);
+    const groupKey = classifier(primitive);
+    const key = `${groupKey}:${JSON.stringify(primitive.material)}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(primitive);
   }
@@ -233,6 +245,7 @@ function mergePrimitivesByMaterial(primitives) {
       objectFeatureId,
       indices,
       material: group[0].material,
+      groupKey: classifier(group[0]),
     };
   });
 }
@@ -316,13 +329,14 @@ function frame(now) {
   renderer.render({
     panels: [panel],
     activeNetId: state.activeNetId,
+    selectedFeatureId: state.selectedFeatureId,
     time: now / 1000,
     layerOffsets: layerZOffsets,
     visibleLayers: state.mode === "3d" ? state.visible3dLayers : state.compareLayers,
     showBoard: state.showBoard,
     showComponents: state.showComponents,
     componentOpacity: clamp(1 - state.separation / 0.1, 0, 1),
-    boardOpacity: 1 - state.separation * 0.72,
+    boardOpacity: state.activeNetId ? 0.34 : 1 - state.separation * 0.72,
     isolateNet: state.isolateNet,
     compareMode: state.mode === "layer",
     compareOffsets,
@@ -402,7 +416,7 @@ function updateCompareLayout(now) {
     ];
     camera.targetOrthoScale = Math.max(totalHeight, totalWidth / aspect) * 1.08;
   }
-  const progress = clamp((now - compareAnimation.started) / 220, 0, 1);
+  const progress = clamp((now - compareAnimation.started) / 420, 0, 1);
   const eased = 1 - Math.pow(1 - progress, 3);
   const offsets = new Map();
   for (const target of targets) {
@@ -583,6 +597,7 @@ function selectNet(netId, shouldFrame) {
   state.selectedFeatureId = 0;
   const net = scene.nets.find((item) => Number(item.id) === netId);
   selectionEl.textContent = JSON.stringify(net || {}, null, 2);
+  updateNetCard();
   if (shouldFrame && net?.boundsMm) camera.frame(runtimeBounds(net.boundsMm));
 }
 
@@ -591,14 +606,64 @@ function selectFeature(featureId, shouldFrame = false) {
   state.selectedFeatureId = featureId;
   state.activeNetId = Number(feature?.netId || 0);
   selectionEl.textContent = feature ? JSON.stringify(feature, null, 2) : "No object selected";
+  updateNetCard();
   if (shouldFrame && feature?.bounds) camera.frame(feature.bounds);
 }
 
 function clearSelection() {
   state.activeNetId = 0;
   state.selectedFeatureId = 0;
+  state.selectionAnchor = null;
   state.isolateNet = false;
   selectionEl.textContent = "No object selected";
+  updateNetCard();
+}
+
+function updateNetCard() {
+  if (!state.activeNetId) {
+    netCardEl.hidden = true;
+    netCardEl.innerHTML = "";
+    return;
+  }
+  const net = scene.nets.find((item) => Number(item.id) === state.activeNetId);
+  if (!net) {
+    netCardEl.hidden = true;
+    netCardEl.innerHTML = "";
+    return;
+  }
+  const details = topology.net_details?.[net.uid] || {};
+  const terminals = details.terminals || [];
+  const metrics = net.metrics || {};
+  netCardEl.innerHTML = `
+    <div class="net-card-head">
+      <span class="net-card-swatch"></span>
+      <div><small>Selected net</small><strong>${escapeHtml(net.name)}</strong></div>
+      <button type="button" aria-label="Clear selected net">×</button>
+    </div>
+    <div class="net-card-meta">
+      <span>${escapeHtml(net.netClass || "Default")}</span>
+      <span>${Number(metrics.traceLengthMm || 0).toFixed(2)} mm</span>
+      <span>${escapeHtml((metrics.layers || []).join(" · ") || "No layer data")}</span>
+    </div>
+    <div class="net-card-endpoints">
+      ${terminals.slice(0, 10).map((terminal) => `
+        <span><b>${escapeHtml(terminal.designator || "?")}</b> pin ${escapeHtml(terminal.pin || "?")}
+          ${terminal.value ? `<small>${escapeHtml(terminal.value)}</small>` : ""}
+        </span>`).join("")}
+      ${terminals.length > 10 ? `<span class="endpoint-more">+${terminals.length - 10} more</span>` : ""}
+    </div>`;
+  netCardEl.hidden = false;
+  const anchor = state.selectionAnchor;
+  if (anchor) {
+    const maxLeft = Math.max(16, canvas.clientWidth - 350);
+    const maxTop = Math.max(16, canvas.clientHeight - 210);
+    netCardEl.style.left = `${clamp(anchor.x + 18, 16, maxLeft)}px`;
+    netCardEl.style.top = `${clamp(anchor.y + 18, 16, maxTop)}px`;
+  } else {
+    netCardEl.style.left = "20px";
+    netCardEl.style.top = "20px";
+  }
+  netCardEl.querySelector("button").addEventListener("click", clearSelection);
 }
 
 function frameSelection() {
@@ -663,8 +728,13 @@ async function pickAt(event) {
   const rect = canvas.getBoundingClientRect();
   const x = (event.clientX - rect.left) * canvas.width / rect.width;
   const y = (event.clientY - rect.top) * canvas.height / rect.height;
+  state.selectionAnchor = {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
+  };
   const featureId = await renderer.pick(panel, x, y, {
     activeNetId: state.activeNetId,
+    selectedFeatureId: state.selectedFeatureId,
     layerOffsets: stackupOffsets(),
     visibleLayers: state.mode === "3d" ? state.visible3dLayers : state.compareLayers,
     showBoard: state.showBoard,
@@ -676,6 +746,7 @@ async function pickAt(event) {
     compareOffsets,
   });
   if (featureId) selectFeature(featureId, false);
+  else clearSelection();
 }
 
 function handleKey(event) {
@@ -727,35 +798,115 @@ function drawGizmo() {
   context.clearRect(0, 0, gizmo.width, gizmo.height);
   const center = [gizmo.width / 2, gizmo.height / 2];
   const basis = camera.basis();
-  for (const axis of [
-    { label: "X", color: "#d95353", vector: basis.right },
-    { label: "Y", color: "#4ba763", vector: basis.up },
-    { label: "Z", color: "#4d83cf", vector: basis.back },
-  ]) {
-    const end = [center[0] + axis.vector[0] * 27, center[1] - axis.vector[1] * 27];
+  const worldAxes = [
+    { axis: "x", label: "X", color: "#e23838", vector: [1, 0, 0] },
+    { axis: "y", label: "Y", color: "#2dbd50", vector: [0, 1, 0] },
+    { axis: "z", label: "Z", color: "#3157d5", vector: [0, 0, 1] },
+  ];
+  const endpoints = [];
+  for (const axis of worldAxes) {
+    for (const sign of [-1, 1]) {
+      const vector = axis.vector.map((value) => value * sign);
+      const projected = [
+        dot3(vector, basis.right),
+        -dot3(vector, basis.up),
+        dot3(vector, basis.back),
+      ];
+      endpoints.push({
+        ...axis,
+        sign,
+        depth: projected[2],
+        point: [center[0] + projected[0] * 34, center[1] + projected[1] * 34],
+      });
+    }
+  }
+  for (const axis of worldAxes) {
+    const positive = endpoints.find((item) => item.axis === axis.axis && item.sign === 1);
     context.strokeStyle = axis.color;
-    context.lineWidth = 2;
+    context.lineWidth = 2.4;
     context.beginPath();
     context.moveTo(...center);
-    context.lineTo(...end);
+    context.lineTo(...positive.point);
     context.stroke();
-    context.fillStyle = axis.color;
-    context.font = "600 10px system-ui";
-    context.fillText(axis.label, end[0] + 3, end[1] - 3);
+  }
+  gizmoHits = [];
+  for (const endpoint of endpoints.sort((a, b) => b.depth - a.depth)) {
+    const front = endpoint.sign === 1;
+    const radius = front ? 13 : 9;
+    context.beginPath();
+    context.arc(endpoint.point[0], endpoint.point[1], radius, 0, Math.PI * 2);
+    context.fillStyle = front ? endpoint.color : `${endpoint.color}66`;
+    context.fill();
+    context.lineWidth = 2;
+    context.strokeStyle = darken(endpoint.color, front ? 0.45 : 0.58);
+    context.stroke();
+    if (front) {
+      context.fillStyle = "#07101c";
+      context.font = "700 13px system-ui";
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(endpoint.label, endpoint.point[0], endpoint.point[1] + 0.5);
+    }
+    gizmoHits.push({ ...endpoint, radius: radius + 5 });
   }
 }
 
 gizmo.addEventListener("click", (event) => {
-  const x = event.offsetX / gizmo.clientWidth;
-  camera.setAxis(x < 0.34 ? "x" : x < 0.67 ? "y" : "z", false);
+  const scaleX = gizmo.width / gizmo.clientWidth;
+  const scaleY = gizmo.height / gizmo.clientHeight;
+  const point = [event.offsetX * scaleX, event.offsetY * scaleY];
+  const hit = gizmoHits
+    .map((item) => ({ item, distance: Math.hypot(point[0] - item.point[0], point[1] - item.point[1]) }))
+    .filter(({ item, distance }) => distance <= item.radius)
+    .sort((a, b) => a.distance - b.distance)[0]?.item;
+  if (hit) camera.setAxis(hit.axis, hit.sign < 0);
 });
 
 function updateLayerLabels() {
-  labelsEl.innerHTML = state.mode === "layer"
-    ? compareAnimation.labels.map(
-        (label) => `<span style="left:${label.left};top:${label.top}">${label.name}</span>`,
-      ).join("")
-    : "";
+  if (state.mode !== "layer" || !panel) {
+    labelsEl.innerHTML = "";
+    return;
+  }
+  const bounds = runtimeBoundsFromGltf(scene.manifest.bbox);
+  labelsEl.innerHTML = scene.copperLayers
+    .filter((layer) => state.compareLayers.has(Number(layer.id)))
+    .map((layer) => {
+      const offset = compareOffsets.get(Number(layer.id)) || [0, 0, 0];
+      const screen = projectPoint(
+        [bounds[0] + offset[0], bounds[4] + offset[1], 0],
+        panel.matrix,
+        canvas.clientWidth,
+        canvas.clientHeight,
+      );
+      if (!screen || screen[0] < -100 || screen[0] > canvas.clientWidth + 100
+        || screen[1] < -100 || screen[1] > canvas.clientHeight + 100) return "";
+      return `<span style="left:${screen[0]}px;top:${screen[1]}px">${escapeHtml(layer.name)}</span>`;
+    }).join("");
+}
+
+function projectPoint(point, matrix, width, height) {
+  const x = point[0];
+  const y = point[1];
+  const z = point[2];
+  const clipX = matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12];
+  const clipY = matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13];
+  const clipW = matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15];
+  if (Math.abs(clipW) < 1e-8) return null;
+  return [
+    (clipX / clipW * 0.5 + 0.5) * width,
+    (0.5 - clipY / clipW * 0.5) * height,
+  ];
+}
+
+function dot3(a, b) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function darken(color, factor) {
+  const clean = color.replace("#", "");
+  return `#${[0, 2, 4].map((offset) =>
+    Math.round(parseInt(clean.slice(offset, offset + 2), 16) * factor)
+      .toString(16).padStart(2, "0")).join("")}`;
 }
 
 function updateDiagnostics(now) {
