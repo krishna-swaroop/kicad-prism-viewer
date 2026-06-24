@@ -45,10 +45,14 @@ struct VertexOut {
   let selected = page.flags.x > 0.5;
   let containsNet = page.flags.y > 0.5;
   let hasActiveNet = page.flags.z > 0.5;
+  let nativeDetail = page.flags.w > 0.5;
   if (edge < 0.006) {
     if (containsNet) { return vec4f(0.12, 0.92, 0.35, 1.0); }
     if (selected) { return vec4f(0.12, 0.45, 0.95, 1.0); }
     return vec4f(0.28, 0.32, 0.39, 1.0);
+  }
+  if (nativeDetail) {
+    return vec4f(0.925, 0.918, 0.865, 1.0);
   }
   let dim = select(1.0, select(0.42, 1.0, containsNet), hasActiveNet);
   return vec4f(sampled.rgb * dim, 1.0);
@@ -167,7 +171,7 @@ export class SchematicWorldRenderer {
     const response = await fetch(manifestUrl, { cache: "no-store" });
     if (!response.ok) throw new Error(`Failed to load schematic manifest: ${response.status}`);
     const manifest = await response.json();
-    if (!["prism.schematic_world_a0", "prism.schematic_scene_a0"].includes(manifest.schema)) {
+    if (!["prism.schematic_world_a0", "prism.schematic_vector_a0"].includes(manifest.schema)) {
       throw new Error(`Unsupported schematic scene schema: ${manifest.schema}`);
     }
     const featurePath = manifest.featureTable || manifest.features;
@@ -182,7 +186,7 @@ export class SchematicWorldRenderer {
     this.device = device;
     this.manifestUrl = manifestUrl;
     this.manifest = manifest;
-    this.isNativeScene = manifest.schema === "prism.schematic_scene_a0";
+    this.isNativeScene = manifest.schema === "prism.schematic_vector_a0";
     this.pages = manifest.pages || [];
     this.featuresByPage = featuresByPage;
     this.featuresById = new Map();
@@ -476,12 +480,15 @@ export class SchematicWorldRenderer {
     for (const page of visible) {
       const resource = this.pageResources.get(page.id);
       const containsNet = this.activeNetUid && page.netUids.includes(this.activeNetUid);
+      const pageIsDetailed = this.pageHasNativeDetail(page) && this.pagePixelWidth(page) > NATIVE_DETAIL_PAGE_PIXELS * 0.72;
+      const nativeChunk = this.vectorChunks.get(page.id);
+      const showNativeDetail = pageIsDetailed && Boolean(nativeChunk?.loaded && nativeChunk?.segments?.length);
       const values = new Float32Array([
         page.worldX, page.worldY, page.widthMm, page.heightMm,
         page.id === this.selectedPageId ? 1 : 0,
         containsNet ? 1 : 0,
         this.activeNetUid ? 1 : 0,
-        0,
+        showNativeDetail ? 1 : 0,
       ]);
       this.device.queue.writeBuffer(resource.uniform, 0, values);
       pass.setBindGroup(0, resource.bindGroup);
@@ -491,9 +498,9 @@ export class SchematicWorldRenderer {
         512,
         6144,
       );
-      if (resource.textureWidth < wantedWidth * 0.82) void this.loadPageTexture(page, wantedWidth);
-      if (this.isNativeScene && this.pagePixelWidth(page) > NATIVE_DETAIL_PAGE_PIXELS) {
-        void this.loadPageVectors(page);
+      if (resource.textureWidth < wantedWidth * 0.82) void this.loadPageTexture(page, wantedWidth).catch(() => {});
+      if (this.pageHasNativeDetail(page) && this.pagePixelWidth(page) > NATIVE_DETAIL_PAGE_PIXELS) {
+        void this.loadPageVectors(page).catch(() => {});
       }
     }
     const vectorCount = this.writeVisibleVectors(visible);
@@ -518,8 +525,11 @@ export class SchematicWorldRenderer {
   writeVisibleVectors(visiblePages) {
     if (!this.isNativeScene) return 0;
     const floats = [];
-    const selectedFeatureIds = new Set();
+    let truncated = false;
+    const canAppend = () => floats.length + 36 <= MAX_VECTOR_FLOATS;
+    pageLoop:
     for (const page of visiblePages) {
+      if (!this.pageHasNativeDetail(page)) continue;
       const chunk = this.vectorChunks.get(page.id);
       if (!chunk?.segments?.length) continue;
       const pageIsDetailed = this.pagePixelWidth(page) > NATIVE_DETAIL_PAGE_PIXELS * 0.72;
@@ -528,24 +538,33 @@ export class SchematicWorldRenderer {
         const feature = this.featuresById.get(segment.featureId);
         const isSelectedNet = this.activeNetUid && feature?.netUid === this.activeNetUid;
         const isSelectedFeature = this.selectedFeatureId === segment.featureId;
-        if (this.activeNetUid && !isSelectedNet && !isSelectedFeature && isElectricalFeature(feature)) continue;
+        if (!canAppend()) {
+          truncated = true;
+          break pageLoop;
+        }
         const color = isSelectedFeature
           ? [0.24, 0.58, 1.0, 1.0]
           : isSelectedNet
           ? [0.06, 1.0, 0.24, 1.0]
-          : vectorColor(feature, segment.kind);
+          : this.activeNetUid && isElectricalFeature(feature)
+          ? mutedVectorColor(feature, segment.kind, segment.color)
+          : vectorColor(feature, segment.kind, segment.color);
         const a = this.sourceToWorld(page, segment.a);
         const b = this.sourceToWorld(page, segment.b);
         const width = this.segmentWorldWidth(page, segment, feature, isSelectedNet || isSelectedFeature);
         appendStrokeQuad(floats, a, b, width, color);
-        selectedFeatureIds.add(segment.featureId);
-        if (floats.length >= MAX_VECTOR_FLOATS - 36) break;
       }
     }
+    this.vectorTruncated = truncated;
     if (!floats.length) return 0;
     const data = new Float32Array(floats);
     this.device.queue.writeBuffer(this.vectorBuffer, 0, data);
     return data.length / 6;
+  }
+
+  pageHasNativeDetail(page) {
+    if (!this.isNativeScene) return false;
+    return page?.nativeDetail?.enabled !== false;
   }
 
   writeNetHighlights(visiblePages) {
@@ -586,7 +605,7 @@ export class SchematicWorldRenderer {
   }
 
   async loadPageVectors(page) {
-    if (!this.isNativeScene || !page.chunks?.lod2) return null;
+    if (!this.pageHasNativeDetail(page) || !page.chunks?.lod2) return null;
     const existing = this.vectorChunks.get(page.id);
     if (existing?.loaded) return existing;
     if (existing?.promise) return existing.promise;
@@ -657,7 +676,7 @@ export class SchematicWorldRenderer {
     const worker = async () => {
       while (queue.length) {
         const page = queue.shift();
-        await this.loadPageTexture(page, 512);
+        await this.loadPageTexture(page, 512).catch(() => {});
       }
     };
     return Promise.all(Array.from({ length: Math.min(4, queue.length) }, worker));
@@ -693,6 +712,7 @@ export class SchematicWorldRenderer {
     if (!this.isNativeScene) return this.hitFeature(clientX, clientY);
     const page = this.hitPage(clientX, clientY);
     if (!page) return null;
+    if (!this.pageHasNativeDetail(page)) return this.hitFeature(clientX, clientY);
     await this.loadPageVectors(page);
     const feature = await this.gpuPickFeature(page, clientX, clientY);
     if (feature) return { page, feature, source: this.clientToSource(page, clientX, clientY), native: true, gpu: true };
@@ -708,15 +728,6 @@ export class SchematicWorldRenderer {
       5 * this.scale * this.canvas.width / Math.max(1, this.canvas.clientWidth)
         * page.sourceWidthMm / page.widthMm,
     );
-    const priorities = {
-      symbol_instance: 6,
-      sheet: 5,
-      junction: 4,
-      no_connect: 4,
-      wire: 3,
-      text: 2,
-      image: 1,
-    };
     const vectorHit = this.hitResidentVectorFeature(page, sourceX, sourceY, tolerance);
     if (vectorHit) return { page, feature: vectorHit, source: [sourceX, sourceY], native: true };
     const candidates = (this.featuresByPage[page.id] || [])
@@ -730,7 +741,7 @@ export class SchematicWorldRenderer {
       })
       .map((feature) => ({
         feature,
-        priority: priorities[feature.kind] || 0,
+        priority: featurePickPriority(feature),
         area: Math.max(0.0001, (feature.boundsMm[2] - feature.boundsMm[0]) * (feature.boundsMm[3] - feature.boundsMm[1])),
       }))
       .sort((a, b) => b.priority - a.priority || a.area - b.area);
@@ -764,17 +775,23 @@ export class SchematicWorldRenderer {
     const buffer = new ArrayBuffer(MAX_PICK_VERTICES * 12);
     const view = new DataView(buffer);
     let count = 0;
+    const pickSegments = [];
     for (const page of pages) {
       const chunk = this.vectorChunks.get(page.id);
       if (!chunk?.segments?.length) continue;
       for (const segment of chunk.segments) {
-        if (count + 6 > MAX_PICK_VERTICES) break;
         const feature = this.featuresById.get(segment.featureId);
-        const a = this.sourceToWorld(page, segment.a);
-        const b = this.sourceToWorld(page, segment.b);
-        const width = Math.max(this.segmentWorldWidth(page, segment, feature, false), this.scale * 7);
-        count = writePickStrokeQuad(view, count, a, b, width, segment.featureId);
+        if (!feature) continue;
+        pickSegments.push({ page, segment, feature, priority: featurePickPriority(feature) });
       }
+    }
+    pickSegments.sort((a, b) => a.priority - b.priority);
+    for (const { page, segment, feature } of pickSegments) {
+      if (count + 6 > MAX_PICK_VERTICES) break;
+      const a = this.sourceToWorld(page, segment.a);
+      const b = this.sourceToWorld(page, segment.b);
+      const width = Math.max(this.segmentWorldWidth(page, segment, feature, false), this.scale * 7);
+      count = writePickStrokeQuad(view, count, a, b, width, segment.featureId);
     }
     if (!count) return 0;
     this.device.queue.writeBuffer(this.pickVertexBuffer, 0, buffer, 0, count * 12);
@@ -833,7 +850,7 @@ export class SchematicWorldRenderer {
       const distance = pointSegmentDistance([sourceX, sourceY], segment.a, segment.b);
       if (distance > widthTolerance) continue;
       if (!feature) continue;
-      const score = distance + (isElectricalFeature(feature) ? 0 : 100);
+      const score = distance - featurePickPriority(feature) * 0.025 + (isElectricalFeature(feature) ? 0 : 8);
       if (!best || score < best.score) best = { feature, score };
     }
     return best?.feature || null;
@@ -887,7 +904,7 @@ function thumbnailPath(page) {
 }
 
 function normalizeFeatureTable(payload) {
-  if (payload.schema === "prism.schematic_scene_a0.features") {
+  if (payload.schema === "prism.schematic_vector_a0.features") {
     const byId = new Map((payload.features || []).map((feature) => [Number(feature.id), feature]));
     const pages = {};
     for (const [pageId, ids] of Object.entries(payload.pages || {})) {
@@ -903,8 +920,12 @@ function primitiveSegments(primitives) {
   for (const primitive of primitives) {
     const featureId = Number(primitive.featureId || 0);
     if (!featureId) continue;
-    const widthMm = primitive.widthMm || primitive.pen_widthMm || 0.15;
-    const add = (a, b) => segments.push({ featureId, kind: primitive.kind, widthMm, a, b });
+    const semanticRole = String(primitive.semanticRole || "");
+    const radiusMm = primitive.radiusMm || primitive.diameterMm / 2 || 0;
+    const widthMm = semanticRole === "junction" && radiusMm
+      ? radiusMm * 1.85
+      : primitive.widthMm || primitive.pen_widthMm || 0.15;
+    const add = (a, b) => segments.push({ featureId, kind: primitive.kind, widthMm, a, b, color: primitive.color || primitive.style?.color || "" });
     const x1 = primitive.x1Mm;
     const y1 = primitive.y1Mm;
     const x2 = primitive.x2Mm;
@@ -915,6 +936,11 @@ function primitiveSegments(primitives) {
       }
       if (shouldClosePolyline(primitive)) {
         add(primitive.pointsMm[primitive.pointsMm.length - 1], primitive.pointsMm[0]);
+      }
+    } else if (primitive.polylinesMm?.length) {
+      for (const polyline of primitive.polylinesMm) {
+        if (!Array.isArray(polyline) || polyline.length < 2) continue;
+        for (let index = 1; index < polyline.length; index += 1) add(polyline[index - 1], polyline[index]);
       }
     } else if (Number.isFinite(x1) && Number.isFinite(y1) && Number.isFinite(x2) && Number.isFinite(y2)) {
       if (primitive.kind === "rect") {
@@ -928,8 +954,12 @@ function primitiveSegments(primitives) {
     } else if (Number.isFinite(primitive.cxMm) && Number.isFinite(primitive.cyMm)) {
       const radius = primitive.radiusMm || primitive.diameterMm / 2 || 0.4;
       appendCircle(segments, featureId, primitive.kind, [primitive.cxMm, primitive.cyMm], radius, widthMm);
-    } else if (primitive.kind === "text" && Number.isFinite(primitive.xMm) && Number.isFinite(primitive.yMm)) {
-      appendTextSegments(segments, primitive, featureId);
+    } else if (primitive.contoursMm?.length) {
+      for (const contour of primitive.contoursMm) {
+        if (!Array.isArray(contour) || contour.length < 2) continue;
+        for (let index = 1; index < contour.length; index += 1) add(contour[index - 1], contour[index]);
+        add(contour[contour.length - 1], contour[0]);
+      }
     } else if (
       Number.isFinite(primitive.start_xMm)
       && Number.isFinite(primitive.start_yMm)
@@ -966,113 +996,6 @@ function appendCircle(segments, featureId, kind, center, radius, widthMm) {
   }
 }
 
-const GLYPH_SEGMENTS = {
-  A: ["AB", "BC", "CD", "EF", "GH", "FG"],
-  B: ["AE", "AB", "BC", "CD", "EF", "GH", "FG", "ED"],
-  C: ["AB", "AE", "ED"],
-  D: ["AE", "AB", "BC", "CD", "DE"],
-  E: ["AB", "AE", "FG", "ED"],
-  F: ["AB", "AE", "FG"],
-  G: ["AB", "AE", "ED", "DC", "CG"],
-  H: ["AE", "BC", "FG"],
-  I: ["AB", "ED", "IJ"],
-  J: ["AB", "BC", "CD", "DE"],
-  K: ["AE", "FI", "FJ"],
-  L: ["AE", "ED"],
-  M: ["AE", "AH", "HB", "BC"],
-  N: ["AE", "AC", "BC"],
-  O: ["AB", "BC", "CD", "DE", "EA"],
-  P: ["AE", "AB", "BC", "CG", "GF"],
-  Q: ["AB", "BC", "CD", "DE", "EA", "JD"],
-  R: ["AE", "AB", "BC", "CG", "GF", "FD"],
-  S: ["AB", "AE", "FG", "CD", "DE"],
-  T: ["AB", "IJ"],
-  U: ["AE", "ED", "DC", "CB"],
-  V: ["AE", "EJ", "JB"],
-  W: ["AE", "EJ", "JD", "DC", "CB"],
-  X: ["AC", "EB"],
-  Y: ["AH", "BH", "HJ"],
-  Z: ["AB", "BE", "ED"],
-  0: ["AB", "BC", "CD", "DE", "EA"],
-  1: ["HB", "BC", "CD"],
-  2: ["AB", "BC", "CG", "GF", "FE", "ED"],
-  3: ["AB", "BC", "CG", "GF", "CD", "DE"],
-  4: ["AE", "FG", "BC"],
-  5: ["AB", "AE", "FG", "GC", "CD", "DE"],
-  6: ["AB", "AE", "ED", "DC", "CG", "GF"],
-  7: ["AB", "BC"],
-  8: ["AB", "BC", "CD", "DE", "EA", "FG"],
-  9: ["AB", "BC", "CD", "DE", "FG", "AE"],
-  "-": ["FG"],
-  "_": ["ED"],
-  ".": ["KM"],
-  ":": ["HL", "MJ"],
-  "/": ["BE"],
-  "\\": ["AC"],
-  "+": ["FG", "IJ"],
-  "(": ["BH", "HJ", "JD"],
-  ")": ["AH", "HJ", "JC"],
-  "[": ["AB", "AE", "ED"],
-  "]": ["AB", "BC", "CD"],
-};
-
-const GLYPH_POINTS = {
-  A: [0, 0],
-  B: [1, 0],
-  C: [1, 0.52],
-  D: [1, 1],
-  E: [0, 1],
-  F: [0, 0.52],
-  G: [1, 0.52],
-  H: [0.5, 0.18],
-  I: [0.5, 0],
-  J: [0.5, 1],
-  K: [0.55, 0.86],
-  L: [0.5, 0.32],
-  M: [0.5, 0.68],
-};
-
-function appendTextSegments(segments, primitive, featureId) {
-  const text = String(primitive.text || "").slice(0, 160);
-  if (!text.trim()) return;
-  const bounds = primitive.boundsMm;
-  const nominalHeight = Math.max(0.8, primitive.size_yMm || primitive.size_xMm || 1.27);
-  const height = bounds
-    ? Math.max(0.45, Math.min(nominalHeight * 1.6, bounds[3] - bounds[1] || nominalHeight))
-    : nominalHeight;
-  const glyphWidth = Math.max(0.38, height * 0.56);
-  const advance = glyphWidth * 0.82;
-  const originX = bounds ? bounds[0] : primitive.xMm;
-  const originY = bounds ? bounds[1] : primitive.yMm - height * 0.5;
-  const angle = (Number.isFinite(primitive.angle) ? primitive.angle : 0) * Math.PI / 180;
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
-  const widthMm = Math.max(0.045, primitive.widthMm || primitive.pen_widthMm || height * 0.065);
-
-  const transform = (localX, localY) => [
-    originX + localX * cos - localY * sin,
-    originY + localX * sin + localY * cos,
-  ];
-
-  let cursor = 0;
-  for (const rawChar of text.toUpperCase()) {
-    if (rawChar === " " || rawChar === "\t") {
-      cursor += advance;
-      continue;
-    }
-    const strokes = GLYPH_SEGMENTS[rawChar] || ["AB", "BC", "CD", "DE", "EA", "AC"];
-    for (const stroke of strokes) {
-      const p0 = GLYPH_POINTS[stroke[0]];
-      const p1 = GLYPH_POINTS[stroke[1]];
-      if (!p0 || !p1) continue;
-      const a = transform(cursor + p0[0] * glyphWidth, p0[1] * height);
-      const b = transform(cursor + p1[0] * glyphWidth, p1[1] * height);
-      segments.push({ featureId, kind: "text", widthMm, a, b });
-    }
-    cursor += advance;
-  }
-}
-
 function shouldClosePolyline(primitive) {
   return ["plotpoly", "polygon", "polyline", "fill"].includes(String(primitive.kind || ""));
 }
@@ -1081,18 +1004,62 @@ function isElectricalFeature(feature) {
   return Boolean(feature?.netUid);
 }
 
-function vectorColor(feature, primitiveKind) {
+function featurePickPriority(feature) {
+  const kind = String(feature?.kind || "");
+  const semantic = String(feature?.semanticRole || "");
+  const role = semantic || kind;
+  if (role === "pin_number" || role === "pin_name") return 120;
+  if (role === "pin_body" || kind === "pin") return 110;
+  if (role === "symbol_reference" || role === "symbol_value") return 92;
+  if (kind === "junction" || kind === "no_connect") return 88;
+  if (kind === "wire" || kind === "bus" || kind === "bus_entry") return 78;
+  if (role === "symbol_body" || kind === "symbol_body") return 45;
+  if (kind === "symbol_instance" || kind === "symbol_overplot") return 30;
+  if (kind === "text" || String(role).includes("text")) return 24;
+  return 10;
+}
+
+function parseColor(color) {
+  if (!color || typeof color !== "string") return null;
+  const value = color.trim();
+  const match = value.match(/^#([0-9a-f]{6})([0-9a-f]{2})?$/i);
+  if (!match) return null;
+  const hex = match[1];
+  const alpha = match[2] ?? "ff";
+  return [
+    parseInt(hex.slice(0, 2), 16) / 255,
+    parseInt(hex.slice(2, 4), 16) / 255,
+    parseInt(hex.slice(4, 6), 16) / 255,
+    parseInt(alpha, 16) / 255,
+  ];
+}
+
+function vectorColor(feature, primitiveKind, sourceColor = "") {
+  const parsed = parseColor(sourceColor || feature?.color || "");
+  if (parsed) return parsed;
   if (isElectricalFeature(feature)) return [0.12, 0.56, 0.2, 0.96];
-  if (feature?.kind === "symbol_instance") return [0.42, 0.18, 0.18, 0.72];
-  if (feature?.kind === "text" || primitiveKind === "text") return [0.05, 0.13, 0.16, 0.94];
+  if (feature?.kind === "pin_name") return [0.0, 0.28, 0.31, 0.96];
+  if (feature?.kind === "pin_number") return [0.45, 0.17, 0.16, 0.96];
+  if (feature?.kind === "pin_body") return [0.28, 0.18, 0.18, 0.88];
+  if (feature?.kind === "symbol_body" || feature?.kind === "symbol_instance") return [0.42, 0.18, 0.18, 0.72];
+  if (feature?.kind === "symbol_reference" || feature?.kind === "symbol_value") return [0.05, 0.13, 0.16, 0.94];
+  if (feature?.kind === "text" || String(primitiveKind || "").startsWith("text")) return [0.05, 0.13, 0.16, 0.94];
   return [0.16, 0.17, 0.19, 0.7];
+}
+
+function mutedVectorColor(feature, primitiveKind, sourceColor = "") {
+  const color = vectorColor(feature, primitiveKind, sourceColor);
+  return [color[0] * 0.72, color[1] * 0.72, color[2] * 0.72, Math.min(color[3], 0.38)];
 }
 
 function nativeStrokePixelWidth(feature, primitiveKind, selected) {
   if (selected) return 5.5;
+  if (["pin_name", "pin_number"].includes(String(feature?.kind || ""))) return 1.5;
+  if (feature?.kind === "pin_body") return 1.7;
+  if (String(primitiveKind || "").startsWith("text")) return 1.35;
   if (primitiveKind === "bus" || feature?.kind === "bus") return 4.2;
   if (isElectricalFeature(feature)) return 2.6;
-  if (feature?.kind === "symbol_instance" || feature?.kind === "sheet") return 1.5;
+  if (feature?.kind === "symbol_body" || feature?.kind === "symbol_instance" || feature?.kind === "sheet") return 1.5;
   return 1.25;
 }
 

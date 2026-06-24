@@ -88,12 +88,13 @@ def cmd_from_project(args: argparse.Namespace) -> None:
             args.output,
         )
         semantic_geometry["assets"]["schematic_manifest"] = semantic_geometry["schematic_world"]["path"]
-        semantic_geometry["schematic_scene"] = build_schematic_scene(
+        semantic_geometry["schematic_vector"] = build_schematic_scene(
             design,
             design_payload,
             args.output,
+            topology=topology,
         )
-        semantic_geometry["assets"]["schematic_native_manifest"] = semantic_geometry["schematic_scene"]["path"]
+        semantic_geometry["assets"]["schematic_native_manifest"] = semantic_geometry["schematic_vector"]["path"]
     except Exception as exc:
         print(f"error: semantic PCB geometry export failed for {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(3)
@@ -113,23 +114,23 @@ def cmd_schematic_world(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         raise SystemExit(2)
+    topology = json.loads(topology_path.read_text(encoding="utf-8"))
     try:
         from kicad_monkey import KiCadDesign  # type: ignore
 
         design = KiCadDesign.from_project_file(project_file)
         design_payload = design.to_json(include_indexes=True)
         schematic_world = build_schematic_world(design, design_payload, output_dir)
-        schematic_scene = build_schematic_scene(design, design_payload, output_dir)
+        schematic_vector = build_schematic_scene(design, design_payload, output_dir, topology=topology)
     except Exception as exc:
         print(f"error: schematic world export failed for {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(3)
 
-    topology = json.loads(topology_path.read_text(encoding="utf-8"))
     semantic_geometry = json.loads(semantic_geometry_path.read_text(encoding="utf-8"))
     semantic_geometry["schematic_world"] = schematic_world
-    semantic_geometry["schematic_scene"] = schematic_scene
+    semantic_geometry["schematic_vector"] = schematic_vector
     semantic_geometry.setdefault("assets", {})["schematic_manifest"] = schematic_world["path"]
-    semantic_geometry.setdefault("assets", {})["schematic_native_manifest"] = schematic_scene["path"]
+    semantic_geometry.setdefault("assets", {})["schematic_native_manifest"] = schematic_vector["path"]
     semantic_geometry_path.write_text(json.dumps(semantic_geometry, indent=2), encoding="utf-8")
     export_viewer_html(
         topology,

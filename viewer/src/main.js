@@ -154,18 +154,31 @@ async function boot() {
 }
 
 async function loadSchematicWorld() {
-  const path = semanticGeometry.assets?.schematic_native_manifest
-    || semanticGeometry.schematic_scene?.path
-    || semanticGeometry.assets?.schematic_manifest
+  const nativePath = semanticGeometry.assets?.schematic_native_manifest
+    || semanticGeometry.schematic_vector?.path
+    || semanticGeometry.schematic_scene?.path;
+  const fallbackPath = semanticGeometry.assets?.schematic_manifest
     || semanticGeometry.schematic_world?.path;
   const tab = document.querySelector("[data-workspace=schematic]");
-  if (!path) {
+  if (!nativePath && !fallbackPath) {
     tab.disabled = true;
     tab.title = "No schematic world assets are available";
     return;
   }
-  schematicScene.manifestUrl = new URL(path, location.href).toString();
-  schematicRenderer = await SchematicWorldRenderer.create(schematicCanvas, schematicScene.manifestUrl);
+  const candidates = [nativePath, fallbackPath].filter(Boolean);
+  let lastError = null;
+  for (const path of candidates) {
+    try {
+      schematicScene.manifestUrl = new URL(path, location.href).toString();
+      schematicRenderer = await SchematicWorldRenderer.create(schematicCanvas, schematicScene.manifestUrl);
+      break;
+    } catch (error) {
+      lastError = error;
+      schematicRenderer = null;
+      if (path === fallbackPath) throw error;
+    }
+  }
+  if (!schematicRenderer) throw lastError || new Error("Failed to load schematic viewer assets");
   schematicScene.manifest = schematicRenderer.manifest;
   schematicScene.pages = schematicRenderer.pages;
   schematicScene.byId = new Map(schematicScene.pages.map((page) => [page.id, page]));
@@ -531,8 +544,8 @@ function renderControls() {
 }
 
 function renderSchematicControls() {
-  viewerKindEl.textContent = schematicScene.manifest?.schema === "prism.schematic_scene_a0"
-    ? "Schematic Scene A0"
+  viewerKindEl.textContent = schematicScene.manifest?.schema === "prism.schematic_vector_a0"
+    ? "Schematic Vector A0"
     : "Schematic World A0";
   primaryHeadingEl.textContent = "Pages";
   primaryDescriptionEl.textContent = `${schematicScene.pages.length} hierarchy instances`;
@@ -644,6 +657,7 @@ function selectSchematicNet(netId, shouldFrame) {
   if (!net || !schematicRenderer) return;
   state.activeNetId = netId;
   state.selectedFeatureId = 0;
+  state.selectedSchematicFeature = null;
   schematicRenderer.selectedFeatureId = 0;
   schematicScene.activeNetUid = net.uid;
   schematicRenderer.activeNetUid = net.uid;
@@ -940,24 +954,39 @@ function componentSelectionContent(component) {
 }
 
 function schematicFeatureSelectionContent(feature, page) {
+  const isPin = String(feature.kind || "").startsWith("pin");
+  const pinRows = isPin
+    ? [
+        ["Symbol", feature.reference || feature.designator || "Unknown"],
+        ["Pin", `${feature.pinNumber || "-"}${feature.pinName ? ` ${feature.pinName}` : ""}`],
+        ["Net", feature.netName || "Not connected"],
+        ["PCB Pad", feature.pcbPadId || "Not resolved"],
+        ["Component UID", feature.componentUid || "Not resolved"],
+      ]
+    : [
+        ["Page", page?.name || "Unknown"],
+        ["Kind", feature.kind.replaceAll("_", " ")],
+        ["Net", feature.netName || "Not connected"],
+      ];
   return `
     ${selectionHeader(
       feature.kind.replaceAll("_", " "),
-      feature.reference || feature.text || feature.netName || "Schematic object",
+      feature.pinName || feature.reference || feature.designator || feature.text || feature.netName || "Schematic object",
       "#3b82f6",
     )}
-    ${selectionProperties([
-      ["Page", page?.name || "Unknown"],
-      ["Kind", feature.kind.replaceAll("_", " ")],
-      ["Net", feature.netName || "Not connected"],
-    ])}
+    ${selectionProperties(pinRows)}
     <div class="selection-section">
       <span class="selection-section-title">Source identity</span>
       <div class="selection-table">
         <div class="selection-row">
-          <span><strong>UUID</strong></span>
-          <span title="${escapeHtml(feature.uuid || "")}">${escapeHtml(feature.uuid || "-")}</span>
+          <span><strong>${isPin ? "Pin UUID" : "UUID"}</strong></span>
+          <span title="${escapeHtml(feature.uuid || feature.sourceId || "")}">${escapeHtml(feature.uuid || feature.sourceId || "-")}</span>
           <span title="${escapeHtml(feature.objectId || "")}">${escapeHtml(feature.objectId || "No object ID")}</span>
+        </div>
+        <div class="selection-row">
+          <span><strong>Sheet</strong></span>
+          <span>${escapeHtml(page?.name || "Unknown")}</span>
+          <span title="${escapeHtml(feature.sheetInstancePath || "")}">${escapeHtml(feature.sheetInstancePath || "/")}</span>
         </div>
       </div>
     </div>`;
@@ -977,11 +1006,11 @@ function updateSelectionCard() {
     return;
   }
   selectionCardEl.innerHTML = `
-    ${component
-      ? componentSelectionContent(component)
-      : net
-        ? netSelectionContent(net)
-        : schematicFeatureSelectionContent(schematicFeature, schematicPage)}
+    ${schematicFeature
+      ? schematicFeatureSelectionContent(schematicFeature, schematicPage)
+      : component
+        ? componentSelectionContent(component)
+        : netSelectionContent(net)}
     <div class="selection-card-actions">
       <button type="button" data-action="frame">Frame selection</button>
     </div>`;
