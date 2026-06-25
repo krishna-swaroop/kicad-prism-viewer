@@ -1,4 +1,5 @@
 const VERTEX_STRIDE = 40;
+// WebGPU dynamic uniform offsets require 256-byte alignment; each draw buffer is padded to that size.
 const DRAW_UNIFORM_SIZE = 256;
 const GLOBAL_UNIFORM_SIZE = 112;
 
@@ -290,6 +291,12 @@ export class Renderer {
     this.pickTexture = null;
     this.pickSerial = Promise.resolve();
     this.bundleCache = new Map();
+    this.globalScratch = new ArrayBuffer(GLOBAL_UNIFORM_SIZE);
+    this.globalScratchF32 = new Float32Array(this.globalScratch);
+    this.globalScratchView = new DataView(this.globalScratch);
+    this.drawScratch = new Float32Array(DRAW_UNIFORM_SIZE / 4);
+    this.barrelDrawScratch = new Float32Array(DRAW_UNIFORM_SIZE / 4);
+    this.nextEntryId = 1;
   }
 
   makePipeline(layout, code, format, buffers) {
@@ -373,17 +380,21 @@ export class Renderer {
   addPrimitive(primitive, metadata) {
     const count = primitive.position.length / 3;
     const vertices = new ArrayBuffer(count * VERTEX_STRIDE);
-    const view = new DataView(vertices);
+    const vertexF32 = new Float32Array(vertices);
+    const vertexU32 = new Uint32Array(vertices);
     for (let index = 0; index < count; index += 1) {
-      const offset = index * VERTEX_STRIDE;
-      for (let axis = 0; axis < 3; axis += 1) {
-        view.setFloat32(offset + axis * 4, primitive.position[index * 3 + axis], true);
-        view.setFloat32(offset + 12 + axis * 4, primitive.normal[index * 3 + axis], true);
-      }
-      view.setUint32(offset + 24, primitive.netId[index] || 0, true);
-      view.setUint32(offset + 28, primitive.objectFeatureId[index] || 0, true);
-      view.setUint32(offset + 32, metadata.layerId || 0, true);
-      view.setUint32(offset + 36, metadata.materialId || 0, true);
+      const word = index * 10;
+      const source = index * 3;
+      vertexF32[word] = primitive.position[source];
+      vertexF32[word + 1] = primitive.position[source + 1];
+      vertexF32[word + 2] = primitive.position[source + 2];
+      vertexF32[word + 3] = primitive.normal[source];
+      vertexF32[word + 4] = primitive.normal[source + 1];
+      vertexF32[word + 5] = primitive.normal[source + 2];
+      vertexU32[word + 6] = primitive.netId[index] || 0;
+      vertexU32[word + 7] = primitive.objectFeatureId[index] || 0;
+      vertexU32[word + 8] = metadata.layerId || 0;
+      vertexU32[word + 9] = metadata.materialId || 0;
     }
     const vertexBuffer = this.device.createBuffer({ size: vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.device.queue.writeBuffer(vertexBuffer, 0, vertices);
@@ -399,7 +410,7 @@ export class Renderer {
         { binding: 2, resource: { buffer: this.layerOffsetBuffer } },
       ],
     });
-    const entry = { ...metadata, primitive, vertexBuffer, indexBuffer, indexCount: indices.length, drawBuffer, bindGroup };
+    const entry = { ...metadata, id: this.nextEntryId++, vertexBuffer, indexBuffer, indexCount: indices.length, drawBuffer, bindGroup };
     this.entries.push(entry);
     this.bundleCache.clear();
     return entry;
@@ -476,7 +487,7 @@ export class Renderer {
     compareOffsets = new Map(),
   }) {
     this.resize();
-    this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, new Float32Array(layerOffsets));
+    this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, layerOffsets);
     const targetView = this.context.getCurrentTexture().createView();
     panels.forEach((panel, panelIndex) => {
       const encoder = this.device.createCommandEncoder();
@@ -539,15 +550,17 @@ export class Renderer {
   }
 
   writeGlobals(matrix, activeNetId, selectedLayer, time, selectedFeatureId = 0) {
-    const data = new ArrayBuffer(GLOBAL_UNIFORM_SIZE);
-    new Float32Array(data, 0, 16).set(matrix);
-    const view = new DataView(data);
+    const data = this.globalScratch;
+    const floats = this.globalScratchF32;
+    floats.fill(0);
+    floats.set(matrix, 0);
+    const view = this.globalScratchView;
     view.setUint32(64, activeNetId || 0, true);
     view.setUint32(68, selectedLayer || 0, true);
     view.setFloat32(72, time, true);
     view.setFloat32(76, activeNetId ? 1 : 0, true);
     view.setUint32(80, selectedFeatureId || 0, true);
-    new Float32Array(data, 96, 4).set([0.35, -0.5, 0.8, 0]);
+    floats.set([0.35, -0.5, 0.8, 0], 24);
     this.device.queue.writeBuffer(this.globalBuffer, 0, data);
   }
 
@@ -560,7 +573,8 @@ export class Renderer {
     compareMode = false,
     compareOffset = null,
   ) {
-    const data = new Float32Array(DRAW_UNIFORM_SIZE / 4);
+    const data = this.drawScratch;
+    data.fill(0);
     const color = entry.kind === "copper" ? entry.color : entry.material.baseColor;
     data.set(color, 0);
     data.set([entry.material.metallic || 0, entry.material.roughness ?? 0.72, 0, 0], 4);
@@ -580,7 +594,8 @@ export class Renderer {
   }
 
   writeBarrelDraw(isolateNet = false) {
-    const data = new Float32Array(DRAW_UNIFORM_SIZE / 4);
+    const data = this.barrelDrawScratch;
+    data.fill(0);
     data.set([0.55, 0.35, 0.16, 0.78], 0);
     data.set([0.75, 0.32, 0, 0], 4);
     data.set([1, 1, isolateNet ? 1 : 0, 0], 12);
@@ -588,7 +603,7 @@ export class Renderer {
   }
 
   renderBundle(entries, panelLayerId) {
-    const key = `${panelLayerId}:${entries.map((entry) => this.entries.indexOf(entry)).join(",")}`;
+    const key = `${panelLayerId}:${entries.map((entry) => entry.id).join(",")}`;
     const cached = this.bundleCache.get(key);
     if (cached) return cached;
     const encoder = this.device.createRenderBundleEncoder({
@@ -604,6 +619,7 @@ export class Renderer {
     }
     const bundle = encoder.finish();
     this.bundleCache.set(key, bundle);
+    if (this.bundleCache.size > 32) this.bundleCache.delete(this.bundleCache.keys().next().value);
     return bundle;
   }
 
@@ -624,7 +640,7 @@ export class Renderer {
       performance.now() / 1000,
       options.selectedFeatureId,
     );
-    this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, new Float32Array(options.layerOffsets));
+    this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, options.layerOffsets);
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{ view: this.pickTexture.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" }],

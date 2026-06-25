@@ -131,6 +131,49 @@ struct Out {
   return input.color;
 }`;
 
+const IMAGE_SHADER = `
+struct Globals {
+  camera: vec4f,
+  viewport: vec2f,
+  activeNet: u32,
+  _pad: u32,
+};
+struct ImageQuad {
+  originSize: vec4f,
+  flags: vec4f,
+};
+@group(0) @binding(0) var<uniform> globals: Globals;
+@group(0) @binding(1) var<uniform> imageQuad: ImageQuad;
+@group(0) @binding(2) var imageSampler: sampler;
+@group(0) @binding(3) var imageTexture: texture_2d<f32>;
+
+struct Out {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex fn vs(@builtin(vertex_index) index: u32) -> Out {
+  var positions = array<vec2f, 6>(
+    vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
+    vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0)
+  );
+  let uv = positions[index];
+  let world = imageQuad.originSize.xy + uv * imageQuad.originSize.zw;
+  let halfViewport = globals.viewport * globals.camera.z * 0.5;
+  let clip = vec2f(
+    (world.x - globals.camera.x) / halfViewport.x,
+    -(world.y - globals.camera.y) / halfViewport.y
+  );
+  var out: Out;
+  out.position = vec4f(clip, 0.08, 1.0);
+  out.uv = uv;
+  return out;
+}
+
+@fragment fn fs(input: Out) -> @location(0) vec4f {
+  return textureSample(imageTexture, imageSampler, input.uv);
+}`;
+
 const PICK_SHADER = `
 struct Globals {
   camera: vec4f,
@@ -160,7 +203,11 @@ struct Out {
 
 const NATIVE_DETAIL_PAGE_PIXELS = 760;
 const MAX_VECTOR_FLOATS = 4 * 1024 * 1024;
+const MAX_VECTOR_VERTICES = Math.floor(MAX_VECTOR_FLOATS / 6);
+const MAX_VECTOR_DRAW_FLOATS = MAX_VECTOR_VERTICES * 6;
 const MAX_PICK_VERTICES = 512 * 1024;
+const VECTOR_TILE_SIZE_MM = 18;
+const MAX_RESIDENT_VECTOR_BYTES = 96 * 1024 * 1024;
 
 export class SchematicWorldRenderer {
   static async create(canvas, manifestUrl) {
@@ -269,6 +316,15 @@ export class SchematicWorldRenderer {
       size: this.highlightBufferSize,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
+    this.globalUniformScratch = new Float32Array(12);
+    this.pageUniformScratch = new Float32Array(8);
+    this.imageUniformScratch = new Float32Array(8);
+    this.vectorScratch = new Float32Array(MAX_VECTOR_FLOATS);
+    this.highlightScratch = new Float32Array(this.highlightBufferSize / 4);
+    this.truncatedHighlightCount = 0;
+    this.truncatedVectorCount = 0;
+    this.frameSerial = 0;
+    this.querySerial = 0;
     const vectorModule = device.createShaderModule({ code: VECTOR_SHADER });
     this.vectorPipeline = device.createRenderPipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.edgeLayout] }),
@@ -300,6 +356,23 @@ export class SchematicWorldRenderer {
       size: MAX_VECTOR_FLOATS * 4,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
+    const imageModule = device.createShaderModule({ code: IMAGE_SHADER });
+    this.imagePipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
+      vertex: { module: imageModule, entryPoint: "vs" },
+      fragment: {
+        module: imageModule,
+        entryPoint: "fs",
+        targets: [{
+          format: this.format,
+          blend: {
+            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+          },
+        }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
     const pickModule = device.createShaderModule({ code: PICK_SHADER });
     this.pickPipeline = device.createRenderPipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.edgeLayout] }),
@@ -329,10 +402,12 @@ export class SchematicWorldRenderer {
     this.pickTextureSize = [0, 0];
     this.pickPending = false;
     this.vectorChunks = new Map();
+    this.failedVectorChunks = new Map();
     this.residentVectorBytes = 0;
     this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", mipmapFilter: "linear" });
     this.placeholder = this.createSolidTexture([245, 247, 249, 255]);
     this.pageResources = new Map();
+    this.imageResources = new Map();
     this.loading = new Map();
     this.selectedPageId = "";
     this.selectedFeatureId = 0;
@@ -385,6 +460,23 @@ export class SchematicWorldRenderer {
     this.updateBindGroup(resource);
   }
 
+  createImageResource(path) {
+    const uniform = this.device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const resource = {
+      path,
+      uniform,
+      texture: this.placeholder,
+      loaded: false,
+      bindGroup: null,
+    };
+    this.imageResources.set(path, resource);
+    this.updateBindGroup(resource);
+    return resource;
+  }
+
   updateBindGroup(resource) {
     resource.bindGroup = this.device.createBindGroup({
       layout: this.bindGroupLayout,
@@ -395,6 +487,37 @@ export class SchematicWorldRenderer {
         { binding: 3, resource: resource.texture.createView() },
       ],
     });
+  }
+
+  async loadImageTexture(path) {
+    const resource = this.imageResources.get(path) || this.createImageResource(path);
+    if (resource.loaded) return resource;
+    const key = `image:${path}`;
+    if (this.loading.has(key)) return this.loading.get(key);
+    const promise = (async () => {
+      try {
+        const response = await fetch(new URL(path, this.manifestUrl), { cache: "no-store" });
+        if (!response.ok) throw new Error(`Failed to load schematic image ${path}: ${response.status}`);
+        const blob = await response.blob();
+        const bitmap = await createImageBitmap(blob);
+        const texture = this.device.createTexture({
+          size: [bitmap.width, bitmap.height],
+          format: "rgba8unorm-srgb",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        this.device.queue.copyExternalImageToTexture({ source: bitmap }, { texture }, [bitmap.width, bitmap.height]);
+        bitmap.close();
+        if (resource.texture !== this.placeholder) resource.texture.destroy();
+        resource.texture = texture;
+        resource.loaded = true;
+        this.updateBindGroup(resource);
+      } finally {
+        this.loading.delete(key);
+      }
+      return resource;
+    })();
+    this.loading.set(key, promise);
+    return promise;
   }
 
   createEdgeBuffer() {
@@ -432,15 +555,24 @@ export class SchematicWorldRenderer {
   }
 
   writeGlobals() {
-    const data = new ArrayBuffer(48);
-    const floats = new Float32Array(data);
-    floats.set([this.center[0], this.center[1], this.scale, 0], 0);
-    floats.set([this.canvas.width, this.canvas.height], 4);
-    this.device.queue.writeBuffer(this.globalBuffer, 0, data);
+    const floats = this.globalUniformScratch;
+    floats[0] = this.center[0];
+    floats[1] = this.center[1];
+    floats[2] = this.scale;
+    floats[3] = 0;
+    floats[4] = this.canvas.width;
+    floats[5] = this.canvas.height;
+    this.device.queue.writeBuffer(this.globalBuffer, 0, floats);
   }
 
   pagePixelWidth(page) {
     return page.widthMm / this.scale;
+  }
+
+  pageNativeDetailReady(page) {
+    if (!this.pageHasNativeDetail(page) || this.pagePixelWidth(page) <= NATIVE_DETAIL_PAGE_PIXELS) return false;
+    const chunk = this.vectorChunks.get(page.id);
+    return Boolean(chunk?.loaded && (chunk.segments?.length || chunk.fills?.length));
   }
 
   visiblePages() {
@@ -457,7 +589,33 @@ export class SchematicWorldRenderer {
       && page.worldY <= bottom);
   }
 
+  worldViewportBounds(padMm = 0) {
+    const halfW = this.canvas.width * this.scale / 2;
+    const halfH = this.canvas.height * this.scale / 2;
+    return [
+      this.center[0] - halfW - padMm,
+      this.center[1] - halfH - padMm,
+      this.center[0] + halfW + padMm,
+      this.center[1] + halfH + padMm,
+    ];
+  }
+
+  sourceViewportBounds(page, padMm = 2.5) {
+    const bounds = this.worldViewportBounds(this.scale * 8);
+    const left = (bounds[0] - page.worldX) / page.widthMm * page.sourceWidthMm - padMm;
+    const top = (bounds[1] - page.worldY) / page.heightMm * page.sourceHeightMm - padMm;
+    const right = (bounds[2] - page.worldX) / page.widthMm * page.sourceWidthMm + padMm;
+    const bottom = (bounds[3] - page.worldY) / page.heightMm * page.sourceHeightMm + padMm;
+    return [
+      Math.max(-padMm, Math.min(left, right)),
+      Math.max(-padMm, Math.min(top, bottom)),
+      Math.min(page.sourceWidthMm + padMm, Math.max(left, right)),
+      Math.min(page.sourceHeightMm + padMm, Math.max(top, bottom)),
+    ];
+  }
+
   render() {
+    this.frameSerial += 1;
     this.resize();
     this.writeGlobals();
     const visible = this.visiblePages();
@@ -480,16 +638,16 @@ export class SchematicWorldRenderer {
     for (const page of visible) {
       const resource = this.pageResources.get(page.id);
       const containsNet = this.activeNetUid && page.netUids.includes(this.activeNetUid);
-      const pageIsDetailed = this.pageHasNativeDetail(page) && this.pagePixelWidth(page) > NATIVE_DETAIL_PAGE_PIXELS * 0.72;
-      const nativeChunk = this.vectorChunks.get(page.id);
-      const showNativeDetail = pageIsDetailed && Boolean(nativeChunk?.loaded && nativeChunk?.segments?.length);
-      const values = new Float32Array([
-        page.worldX, page.worldY, page.widthMm, page.heightMm,
-        page.id === this.selectedPageId ? 1 : 0,
-        containsNet ? 1 : 0,
-        this.activeNetUid ? 1 : 0,
-        showNativeDetail ? 1 : 0,
-      ]);
+      const showNativeDetail = this.pageNativeDetailReady(page);
+      const values = this.pageUniformScratch;
+      values[0] = page.worldX;
+      values[1] = page.worldY;
+      values[2] = page.widthMm;
+      values[3] = page.heightMm;
+      values[4] = page.id === this.selectedPageId ? 1 : 0;
+      values[5] = containsNet ? 1 : 0;
+      values[6] = this.activeNetUid ? 1 : 0;
+      values[7] = showNativeDetail ? 1 : 0;
       this.device.queue.writeBuffer(resource.uniform, 0, values);
       pass.setBindGroup(0, resource.bindGroup);
       pass.draw(6);
@@ -510,6 +668,7 @@ export class SchematicWorldRenderer {
       pass.setVertexBuffer(0, this.vectorBuffer);
       pass.draw(vectorCount);
     }
+    this.drawVisibleImages(pass, visible);
     const highlightCount = this.writeNetHighlights(visible);
     if (highlightCount) {
       pass.setPipeline(this.highlightPipeline);
@@ -519,29 +678,83 @@ export class SchematicWorldRenderer {
     }
     pass.end();
     this.device.queue.submit([encoder.finish()]);
+    this.evictVectorChunks(visible);
     return visible;
+  }
+
+  drawVisibleImages(pass, visiblePages) {
+    if (!this.isNativeScene) return;
+    let pipelineSet = false;
+    for (const page of visiblePages) {
+      if (!this.pageHasNativeDetail(page)) continue;
+      const chunk = this.vectorChunks.get(page.id);
+      if (!chunk?.images?.length) continue;
+      const sourceBounds = this.sourceViewportBounds(page, 4);
+      for (const image of chunk.images) {
+        if (!intersectsBounds(image.bounds, sourceBounds)) continue;
+        const resource = this.imageResources.get(image.path) || this.createImageResource(image.path);
+        if (!resource.loaded) void this.loadImageTexture(image.path).catch(() => {});
+        const origin = this.sourceToWorld(page, [image.xMm, image.yMm]);
+        const size = this.sourceSizeToWorld(page, image.widthMm, image.heightMm);
+        const values = this.imageUniformScratch;
+        values[0] = origin[0];
+        values[1] = origin[1];
+        values[2] = size[0];
+        values[3] = size[1];
+        values[4] = 0;
+        values[5] = 0;
+        values[6] = 0;
+        values[7] = 0;
+        this.device.queue.writeBuffer(resource.uniform, 0, values);
+        if (!pipelineSet) {
+          pass.setPipeline(this.imagePipeline);
+          pipelineSet = true;
+        }
+        pass.setBindGroup(0, resource.bindGroup);
+        pass.draw(6);
+      }
+    }
   }
 
   writeVisibleVectors(visiblePages) {
     if (!this.isNativeScene) return 0;
-    const floats = [];
-    let truncated = false;
-    const canAppend = () => floats.length + 36 <= MAX_VECTOR_FLOATS;
+    const values = this.vectorScratch;
+    let offset = 0;
+    let truncated = 0;
+    const canAppend = (floatCount) => offset + floatCount <= MAX_VECTOR_DRAW_FLOATS && offset + floatCount <= values.length;
     pageLoop:
     for (const page of visiblePages) {
       if (!this.pageHasNativeDetail(page)) continue;
       const chunk = this.vectorChunks.get(page.id);
-      if (!chunk?.segments?.length) continue;
-      const pageIsDetailed = this.pagePixelWidth(page) > NATIVE_DETAIL_PAGE_PIXELS * 0.72;
-      if (!pageIsDetailed) continue;
-      for (const segment of chunk.segments) {
+      if (!chunk?.segments?.length && !chunk?.fills?.length) continue;
+      if (!this.pageNativeDetailReady(page)) continue;
+      chunk.lastUsedFrame = this.frameSerial;
+      const sourceBounds = this.sourceViewportBounds(page);
+      const candidates = querySpatialIndex(chunk.spatial, sourceBounds);
+      for (const fill of candidates.fills) {
+        if (!intersectsBounds(fill.bounds, sourceBounds)) continue;
+        if (!canAppend(18)) {
+          truncated += 1;
+          break pageLoop;
+        }
+        const feature = this.featuresById.get(fill.featureId);
+        const isSelectedNet = this.activeNetUid && feature?.netUid === this.activeNetUid;
+        const isSelectedFeature = this.selectedFeatureId === fill.featureId;
+        const color = isSelectedFeature
+          ? [0.24, 0.58, 1.0, 1.0]
+          : isSelectedNet
+          ? [0.06, 1.0, 0.24, 1.0]
+          : this.activeNetUid && isElectricalFeature(feature)
+          ? mutedVectorColor(feature, fill.kind, fill.color)
+          : vectorColor(feature, fill.kind, fill.color);
+        const points = fill.points.map((point) => this.sourceToWorld(page, point));
+        offset = writeFilledTriangle(values, offset, points[0], points[1], points[2], color);
+      }
+      for (const segment of candidates.segments) {
+        if (!intersectsBounds(segment.bounds, sourceBounds)) continue;
         const feature = this.featuresById.get(segment.featureId);
         const isSelectedNet = this.activeNetUid && feature?.netUid === this.activeNetUid;
         const isSelectedFeature = this.selectedFeatureId === segment.featureId;
-        if (!canAppend()) {
-          truncated = true;
-          break pageLoop;
-        }
         const color = isSelectedFeature
           ? [0.24, 0.58, 1.0, 1.0]
           : isSelectedNet
@@ -549,17 +762,23 @@ export class SchematicWorldRenderer {
           : this.activeNetUid && isElectricalFeature(feature)
           ? mutedVectorColor(feature, segment.kind, segment.color)
           : vectorColor(feature, segment.kind, segment.color);
-        const a = this.sourceToWorld(page, segment.a);
-        const b = this.sourceToWorld(page, segment.b);
         const width = this.segmentWorldWidth(page, segment, feature, isSelectedNet || isSelectedFeature);
-        appendStrokeQuad(floats, a, b, width, color);
+        for (const visibleSegment of this.visibleSegmentParts(page, segment, feature)) {
+          if (!canAppend(36)) {
+            truncated += 1;
+            break pageLoop;
+          }
+          const a = this.sourceToWorld(page, visibleSegment.a);
+          const b = this.sourceToWorld(page, visibleSegment.b);
+          offset = writeStrokeQuad(values, offset, a, b, width, color);
+        }
       }
     }
-    this.vectorTruncated = truncated;
-    if (!floats.length) return 0;
-    const data = new Float32Array(floats);
-    this.device.queue.writeBuffer(this.vectorBuffer, 0, data);
-    return data.length / 6;
+    this.truncatedVectorCount = truncated;
+    this.vectorTruncated = truncated > 0;
+    if (!offset) return 0;
+    this.device.queue.writeBuffer(this.vectorBuffer, 0, values, 0, offset);
+    return Math.floor(offset / 6);
   }
 
   pageHasNativeDetail(page) {
@@ -567,25 +786,99 @@ export class SchematicWorldRenderer {
     return page?.nativeDetail?.enabled !== false;
   }
 
-  writeNetHighlights(visiblePages) {
-    if (!this.activeNetUid) return 0;
-    const values = [];
-    for (const page of visiblePages) {
-      for (const feature of this.featuresByPage[page.id] || []) {
-        if (feature.netUid !== this.activeNetUid || !feature.boundsMm) continue;
-        const bounds = this.featureWorldBounds(page, feature.boundsMm);
-        values.push(
-          bounds[0], bounds[1], bounds[2], bounds[1],
-          bounds[2], bounds[1], bounds[2], bounds[3],
-          bounds[2], bounds[3], bounds[0], bounds[3],
-          bounds[0], bounds[3], bounds[0], bounds[1],
-        );
+  featurePrimitiveBounds(page, featureId) {
+    const chunk = this.vectorChunks.get(page.id);
+    if (!chunk?.segments?.length && !chunk?.fills?.length) return null;
+    const xs = [];
+    const ys = [];
+    for (const segment of chunk.segments || []) {
+      if (segment.featureId !== featureId) continue;
+      xs.push(segment.a[0], segment.b[0]);
+      ys.push(segment.a[1], segment.b[1]);
+    }
+    for (const fill of chunk.fills || []) {
+      if (fill.featureId !== featureId) continue;
+      for (const point of fill.points || []) {
+        xs.push(point[0]);
+        ys.push(point[1]);
       }
     }
-    if (!values.length) return 0;
-    const data = new Float32Array(values.slice(0, this.highlightBufferSize / 4));
-    this.device.queue.writeBuffer(this.highlightBuffer, 0, data);
-    return data.length / 2;
+    if (!xs.length) return null;
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  }
+
+  symbolClipBounds(page) {
+    if (!this._symbolClipBounds) this._symbolClipBounds = new Map();
+    if (this._symbolClipBounds.has(page.id)) return this._symbolClipBounds.get(page.id);
+    const bounds = (this.featuresByPage[page.id] || [])
+      .filter((feature) =>
+        feature?.kind === "symbol_body"
+        && feature.boundsMm
+        && !String(feature.sourceId || "").includes(":overplot"))
+      .map((feature) => {
+        const tight = this.featurePrimitiveBounds(page, feature.id) || feature.boundsMm;
+        return [tight[0] - 0.02, tight[1] - 0.02, tight[2] + 0.02, tight[3] + 0.02];
+      })
+      .filter((bounds) => {
+        const width = bounds[2] - bounds[0];
+        const height = bounds[3] - bounds[1];
+        return Math.max(width, height) <= 12 && width * height <= 80;
+      });
+    this._symbolClipBounds.set(page.id, bounds);
+    return bounds;
+  }
+
+  visibleSegmentParts(page, segment, feature) {
+    const kind = String(feature?.kind || "");
+    const role = String(feature?.semanticRole || "");
+    if (kind !== "wire" && role !== "wire") return [segment];
+    let parts = [segment];
+    for (const bounds of this.symbolClipBounds(page)) {
+      const next = [];
+      for (const part of parts) next.push(...clipSegmentOutsideBounds(part, bounds));
+      parts = next;
+      if (!parts.length) break;
+    }
+    return parts;
+  }
+
+  writeNetHighlights(visiblePages) {
+    if (!this.activeNetUid) return 0;
+    const values = this.highlightScratch;
+    let offset = 0;
+    let truncated = 0;
+    for (const page of visiblePages) {
+      const sourceBounds = this.sourceViewportBounds(page, 5);
+      for (const feature of this.featuresByPage[page.id] || []) {
+        if (feature.netUid !== this.activeNetUid || !feature.boundsMm) continue;
+        if (!intersectsBounds(feature.boundsMm, sourceBounds)) continue;
+        const bounds = this.featureWorldBounds(page, feature.boundsMm);
+        if (offset + 16 > values.length) {
+          truncated += 1;
+          continue;
+        }
+        values[offset++] = bounds[0];
+        values[offset++] = bounds[1];
+        values[offset++] = bounds[2];
+        values[offset++] = bounds[1];
+        values[offset++] = bounds[2];
+        values[offset++] = bounds[1];
+        values[offset++] = bounds[2];
+        values[offset++] = bounds[3];
+        values[offset++] = bounds[2];
+        values[offset++] = bounds[3];
+        values[offset++] = bounds[0];
+        values[offset++] = bounds[3];
+        values[offset++] = bounds[0];
+        values[offset++] = bounds[3];
+        values[offset++] = bounds[0];
+        values[offset++] = bounds[1];
+      }
+    }
+    this.truncatedHighlightCount = truncated;
+    if (!offset) return 0;
+    this.device.queue.writeBuffer(this.highlightBuffer, 0, values, 0, offset);
+    return offset / 2;
   }
 
   featureWorldBounds(page, bounds) {
@@ -604,24 +897,65 @@ export class SchematicWorldRenderer {
     ];
   }
 
+  sourceSizeToWorld(page, widthMm, heightMm) {
+    return [
+      widthMm / page.sourceWidthMm * page.widthMm,
+      heightMm / page.sourceHeightMm * page.heightMm,
+    ];
+  }
+
   async loadPageVectors(page) {
     if (!this.pageHasNativeDetail(page) || !page.chunks?.lod2) return null;
     const existing = this.vectorChunks.get(page.id);
     if (existing?.loaded) return existing;
     if (existing?.promise) return existing.promise;
     const promise = (async () => {
-      const response = await fetch(new URL(page.chunks.lod2, this.manifestUrl), { cache: "no-store" });
-      if (!response.ok) throw new Error(`Failed to load schematic vector chunk ${page.id}: ${response.status}`);
-      const payload = await response.json();
-      const segments = primitiveSegments(payload.primitives || []);
-      const bytes = JSON.stringify(payload).length;
-      const chunk = { loaded: true, segments, unsupported: payload.unsupported || [], bytes };
-      this.vectorChunks.set(page.id, chunk);
-      this.residentVectorBytes += bytes;
-      return chunk;
+      try {
+        const response = await fetch(new URL(page.chunks.lod2, this.manifestUrl));
+        if (!response.ok) throw new Error(`Failed to load schematic vector chunk ${page.id}: ${response.status}`);
+        const payload = await response.json();
+        const geometry = primitiveGeometry(payload.primitives || []);
+        const bytes = JSON.stringify(payload).length;
+        const chunk = {
+          loaded: true,
+          segments: geometry.segments,
+          fills: geometry.fills,
+          images: geometry.images,
+          spatial: buildSpatialIndex(geometry),
+          unsupported: payload.unsupported || [],
+          bytes,
+          lastUsedFrame: this.frameSerial,
+        };
+        this.vectorChunks.set(page.id, chunk);
+        this.failedVectorChunks.delete(page.id);
+        this.residentVectorBytes += bytes;
+        return chunk;
+      } catch (error) {
+        const current = this.failedVectorChunks.get(page.id) || { count: 0, message: "" };
+        this.failedVectorChunks.set(page.id, {
+          count: current.count + 1,
+          message: error?.message || String(error),
+        });
+        this.vectorChunks.delete(page.id);
+        throw error;
+      }
     })();
     this.vectorChunks.set(page.id, { loaded: false, promise, segments: [] });
     return promise;
+  }
+
+  evictVectorChunks(visiblePages) {
+    if (this.residentVectorBytes <= MAX_RESIDENT_VECTOR_BYTES) return;
+    const visibleIds = new Set(visiblePages.map((page) => page.id));
+    const candidates = [...this.vectorChunks.entries()]
+      .filter(([, chunk]) => chunk?.loaded)
+      .filter(([pageId]) => !visibleIds.has(pageId) && pageId !== this.selectedPageId)
+      .sort((a, b) => (a[1].lastUsedFrame || 0) - (b[1].lastUsedFrame || 0));
+    for (const [pageId, chunk] of candidates) {
+      this.vectorChunks.delete(pageId);
+      this.residentVectorBytes = Math.max(0, this.residentVectorBytes - (chunk.bytes || 0));
+      if (this.residentVectorBytes <= MAX_RESIDENT_VECTOR_BYTES * 0.82) break;
+    }
   }
 
   async loadPageTexture(page, width) {
@@ -715,7 +1049,9 @@ export class SchematicWorldRenderer {
     if (!this.pageHasNativeDetail(page)) return this.hitFeature(clientX, clientY);
     await this.loadPageVectors(page);
     const feature = await this.gpuPickFeature(page, clientX, clientY);
-    if (feature) return { page, feature, source: this.clientToSource(page, clientX, clientY), native: true, gpu: true };
+    if (feature && !isBackgroundOrPageFeature(feature)) {
+      return { page, feature, source: this.clientToSource(page, clientX, clientY), native: true, gpu: true };
+    }
     return this.hitFeature(clientX, clientY);
   }
 
@@ -730,8 +1066,11 @@ export class SchematicWorldRenderer {
     );
     const vectorHit = this.hitResidentVectorFeature(page, sourceX, sourceY, tolerance);
     if (vectorHit) return { page, feature: vectorHit, source: [sourceX, sourceY], native: true };
+    const symbolInterior = this.hitSymbolInterior(page, sourceX, sourceY);
+    if (symbolInterior) return { page, feature: symbolInterior, source: [sourceX, sourceY], native: true, interior: true };
     const candidates = (this.featuresByPage[page.id] || [])
       .filter((feature) => {
+        if (isBackgroundOrPageFeature(feature)) return false;
         const bounds = feature.boundsMm;
         return bounds
           && sourceX >= bounds[0] - tolerance
@@ -746,6 +1085,22 @@ export class SchematicWorldRenderer {
       }))
       .sort((a, b) => b.priority - a.priority || a.area - b.area);
     return { page, feature: candidates[0]?.feature || null, source: [sourceX, sourceY] };
+  }
+
+  hitSymbolInterior(page, sourceX, sourceY) {
+    let best = null;
+    for (const feature of this.featuresByPage[page.id] || []) {
+      const kind = String(feature?.kind || "");
+      if (kind !== "symbol_body" && kind !== "symbol_instance") continue;
+      if (String(feature?.sourceId || "").includes(":overplot")) continue;
+      const bounds = feature.boundsMm;
+      if (!bounds) continue;
+      if (sourceX < bounds[0] || sourceX > bounds[2] || sourceY < bounds[1] || sourceY > bounds[3]) continue;
+      const area = Math.max(0.0001, (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]));
+      const score = (kind === "symbol_body" ? 0 : 1000000) + area;
+      if (!best || score < best.score) best = { feature, score };
+    }
+    return best?.feature || null;
   }
 
   clientToSource(page, clientX, clientY) {
@@ -778,20 +1133,53 @@ export class SchematicWorldRenderer {
     const pickSegments = [];
     for (const page of pages) {
       const chunk = this.vectorChunks.get(page.id);
-      if (!chunk?.segments?.length) continue;
-      for (const segment of chunk.segments) {
+      if (!chunk?.segments?.length && !chunk?.fills?.length && !chunk?.images?.length) continue;
+      const sourcePoint = this._pickSourcePointByPage?.get(page.id);
+      const sourceBounds = sourcePoint
+        ? [sourcePoint[0] - 2.5, sourcePoint[1] - 2.5, sourcePoint[0] + 2.5, sourcePoint[1] + 2.5]
+        : [0, 0, page.sourceWidthMm, page.sourceHeightMm];
+      const candidates = querySpatialIndex(chunk.spatial, sourceBounds);
+      for (const image of candidates.images) {
+        if (!intersectsBounds(image.bounds, sourceBounds)) continue;
+        const feature = this.featuresById.get(image.featureId);
+        if (!feature || isBackgroundOrPageFeature(feature)) continue;
+        pickSegments.push({ page, image, feature, priority: featurePickPriority(feature) - 5 });
+      }
+      for (const fill of candidates.fills) {
+        if (!intersectsBounds(fill.bounds, sourceBounds)) continue;
+        const feature = this.featuresById.get(fill.featureId);
+        if (!feature || isBackgroundOrPageFeature(feature)) continue;
+        pickSegments.push({ page, fill, feature, priority: featurePickPriority(feature) - 2 });
+      }
+      for (const segment of candidates.segments) {
+        if (!intersectsBounds(segment.bounds, sourceBounds)) continue;
         const feature = this.featuresById.get(segment.featureId);
-        if (!feature) continue;
+        if (!feature || isBackgroundOrPageFeature(feature)) continue;
         pickSegments.push({ page, segment, feature, priority: featurePickPriority(feature) });
       }
     }
     pickSegments.sort((a, b) => a.priority - b.priority);
-    for (const { page, segment, feature } of pickSegments) {
+    for (const { page, segment, fill, image, feature } of pickSegments) {
       if (count + 6 > MAX_PICK_VERTICES) break;
-      const a = this.sourceToWorld(page, segment.a);
-      const b = this.sourceToWorld(page, segment.b);
-      const width = Math.max(this.segmentWorldWidth(page, segment, feature, false), this.scale * 7);
-      count = writePickStrokeQuad(view, count, a, b, width, segment.featureId);
+      if (image) {
+        const p0 = this.sourceToWorld(page, [image.xMm, image.yMm]);
+        const p1 = this.sourceToWorld(page, [image.xMm + image.widthMm, image.yMm]);
+        const p2 = this.sourceToWorld(page, [image.xMm, image.yMm + image.heightMm]);
+        const p3 = this.sourceToWorld(page, [image.xMm + image.widthMm, image.yMm + image.heightMm]);
+        count = writePickTriangle(view, count, p0, p1, p2, image.featureId);
+        count = writePickTriangle(view, count, p2, p1, p3, image.featureId);
+      } else if (fill) {
+        const points = fill.points.map((point) => this.sourceToWorld(page, point));
+        count = writePickTriangle(view, count, points[0], points[1], points[2], fill.featureId);
+      } else {
+        const width = Math.max(this.segmentWorldWidth(page, segment, feature, false), this.scale * 7);
+        for (const visibleSegment of this.visibleSegmentParts(page, segment, feature)) {
+          if (count + 6 > MAX_PICK_VERTICES) break;
+          const a = this.sourceToWorld(page, visibleSegment.a);
+          const b = this.sourceToWorld(page, visibleSegment.b);
+          count = writePickStrokeQuad(view, count, a, b, width, segment.featureId);
+        }
+      }
     }
     if (!count) return 0;
     this.device.queue.writeBuffer(this.pickVertexBuffer, 0, buffer, 0, count * 12);
@@ -800,7 +1188,10 @@ export class SchematicWorldRenderer {
 
   async gpuPickFeature(page, clientX, clientY) {
     if (this.pickPending) return null;
+    const sourcePoint = this.clientToSource(page, clientX, clientY);
+    this._pickSourcePointByPage = new Map([[page.id, sourcePoint]]);
     const count = this.writePickVectors([page]);
+    this._pickSourcePointByPage = null;
     if (!count) return null;
     this.resize();
     this.writeGlobals();
@@ -831,10 +1222,11 @@ export class SchematicWorldRenderer {
     this.device.queue.submit([encoder.finish()]);
     try {
       await this.pickReadBuffer.mapAsync(GPUMapMode.READ);
-      const id = new Uint32Array(this.pickReadBuffer.getMappedRange().slice(0, 4))[0];
+      const id = new DataView(this.pickReadBuffer.getMappedRange()).getUint32(0, true);
       this.pickReadBuffer.unmap();
       return id ? this.featuresById.get(id) || null : null;
     } finally {
+      if (this.pickReadBuffer.mapState === "mapped") this.pickReadBuffer.unmap();
       this.pickPending = false;
     }
   }
@@ -847,11 +1239,13 @@ export class SchematicWorldRenderer {
     for (const segment of chunk.segments) {
       const feature = this.featuresById.get(segment.featureId);
       const widthTolerance = Math.max(tolerance, (segment.widthMm || 0) * 0.5 + tolerance * 0.45);
-      const distance = pointSegmentDistance([sourceX, sourceY], segment.a, segment.b);
-      if (distance > widthTolerance) continue;
       if (!feature) continue;
-      const score = distance - featurePickPriority(feature) * 0.025 + (isElectricalFeature(feature) ? 0 : 8);
-      if (!best || score < best.score) best = { feature, score };
+      for (const visibleSegment of this.visibleSegmentParts(page, segment, feature)) {
+        const distance = pointSegmentDistance([sourceX, sourceY], visibleSegment.a, visibleSegment.b);
+        if (distance > widthTolerance) continue;
+        const score = distance - featurePickPriority(feature) * 0.025 + (isElectricalFeature(feature) ? 0 : 8);
+        if (!best || score < best.score) best = { feature, score };
+      }
     }
     return best?.feature || null;
   }
@@ -915,22 +1309,58 @@ function normalizeFeatureTable(payload) {
   return payload.pages || {};
 }
 
-function primitiveSegments(primitives) {
+function primitiveGeometry(primitives) {
   const segments = [];
+  const fills = [];
+  const images = [];
   for (const primitive of primitives) {
     const featureId = Number(primitive.featureId || 0);
     if (!featureId) continue;
+    if (primitive.kind === "plotimage" && primitive.image?.path) {
+      const xMm = primitive.xMm || 0;
+      const yMm = primitive.yMm || 0;
+      const widthMm = primitive.widthMm || 0;
+      const heightMm = primitive.heightMm || 0;
+      images.push({
+        featureId,
+        kind: primitive.kind,
+        xMm,
+        yMm,
+        widthMm,
+        heightMm,
+        bounds: [xMm, yMm, xMm + widthMm, yMm + heightMm],
+        path: primitive.image.path,
+      });
+      continue;
+    }
     const semanticRole = String(primitive.semanticRole || "");
     const radiusMm = primitive.radiusMm || primitive.diameterMm / 2 || 0;
-    const widthMm = semanticRole === "junction" && radiusMm
-      ? radiusMm * 1.85
-      : primitive.widthMm || primitive.pen_widthMm || 0.15;
-    const add = (a, b) => segments.push({ featureId, kind: primitive.kind, widthMm, a, b, color: primitive.color || primitive.style?.color || "" });
+    const filled = String(primitive.fill || "").toUpperCase() === "FILLED_SHAPE";
+    const widthMm = primitive.widthMm || primitive.pen_widthMm || (semanticRole === "junction" ? 0.08 : 0.15);
+    const lineStyle = String(primitive.lineStyle || primitive.line_style || "DEFAULT").toUpperCase();
+    const color = primitive.color || primitive.strokeColor || primitive.style?.color || "";
+    const fillColor = primitive.fillColor || primitive.color || primitive.style?.color || "";
+    const add = (a, b) => appendStyledSegment(segments, { featureId, kind: primitive.kind, widthMm, lineStyle, color }, a, b);
     const x1 = primitive.x1Mm;
     const y1 = primitive.y1Mm;
     const x2 = primitive.x2Mm;
     const y2 = primitive.y2Mm;
-    if (primitive.pointsMm?.length >= 2) {
+    if (primitive.trianglesMm?.length) {
+      for (const triangle of primitive.trianglesMm) {
+        if (Array.isArray(triangle) && triangle.length === 3) {
+          fills.push({ featureId, kind: primitive.kind, color: fillColor, points: triangle, bounds: pointsBounds(triangle) });
+        }
+      }
+      if (primitive.pointsMm?.length >= 2) {
+        for (let index = 1; index < primitive.pointsMm.length; index += 1) {
+          add(primitive.pointsMm[index - 1], primitive.pointsMm[index]);
+        }
+        if (shouldClosePolyline(primitive)) {
+          add(primitive.pointsMm[primitive.pointsMm.length - 1], primitive.pointsMm[0]);
+        }
+      }
+    } else if (primitive.pointsMm?.length >= 2) {
+      if (filled && primitive.pointsMm.length >= 3) appendPolygonFan(fills, featureId, primitive.kind, primitive.pointsMm, fillColor);
       for (let index = 1; index < primitive.pointsMm.length; index += 1) {
         add(primitive.pointsMm[index - 1], primitive.pointsMm[index]);
       }
@@ -944,6 +1374,7 @@ function primitiveSegments(primitives) {
       }
     } else if (Number.isFinite(x1) && Number.isFinite(y1) && Number.isFinite(x2) && Number.isFinite(y2)) {
       if (primitive.kind === "rect") {
+        if (filled) appendRectFill(fills, featureId, primitive.kind, [x1, y1, x2, y2], fillColor);
         add([x1, y1], [x2, y1]);
         add([x2, y1], [x2, y2]);
         add([x2, y2], [x1, y2]);
@@ -953,12 +1384,25 @@ function primitiveSegments(primitives) {
       }
     } else if (Number.isFinite(primitive.cxMm) && Number.isFinite(primitive.cyMm)) {
       const radius = primitive.radiusMm || primitive.diameterMm / 2 || 0.4;
-      appendCircle(segments, featureId, primitive.kind, [primitive.cxMm, primitive.cyMm], radius, widthMm);
+      if (filled) appendCircleFill(fills, featureId, primitive.kind, [primitive.cxMm, primitive.cyMm], radius, fillColor);
+      appendCircle(segments, { featureId, kind: primitive.kind, widthMm, lineStyle, color }, [primitive.cxMm, primitive.cyMm], radius);
     } else if (primitive.contoursMm?.length) {
       for (const contour of primitive.contoursMm) {
         if (!Array.isArray(contour) || contour.length < 2) continue;
         for (let index = 1; index < contour.length; index += 1) add(contour[index - 1], contour[index]);
         add(contour[contour.length - 1], contour[0]);
+      }
+    } else if (
+      Number.isFinite(primitive.start_xMm)
+      && Number.isFinite(primitive.start_yMm)
+      && Number.isFinite(primitive.end_xMm)
+      && Number.isFinite(primitive.end_yMm)
+    ) {
+      if (Number.isFinite(primitive.mid_xMm) && Number.isFinite(primitive.mid_yMm)) {
+        add([primitive.start_xMm, primitive.start_yMm], [primitive.mid_xMm, primitive.mid_yMm]);
+        add([primitive.mid_xMm, primitive.mid_yMm], [primitive.end_xMm, primitive.end_yMm]);
+      } else {
+        add([primitive.start_xMm, primitive.start_yMm], [primitive.end_xMm, primitive.end_yMm]);
       }
     } else if (
       Number.isFinite(primitive.start_xMm)
@@ -978,26 +1422,196 @@ function primitiveSegments(primitives) {
       add([left, bottom], [left, top]);
     }
   }
-  return segments;
+  return { segments, fills, images };
 }
 
-function appendCircle(segments, featureId, kind, center, radius, widthMm) {
+function appendRectFill(fills, featureId, kind, bounds, color) {
+  const [left, top, right, bottom] = bounds;
+  fills.push(
+    { featureId, kind, color, points: [[left, top], [right, top], [left, bottom]], bounds: [left, top, right, bottom] },
+    { featureId, kind, color, points: [[left, bottom], [right, top], [right, bottom]], bounds: [left, top, right, bottom] },
+  );
+}
+
+function appendCircleFill(fills, featureId, kind, center, radius, color) {
+  const steps = 36;
+  for (let index = 0; index < steps; index += 1) {
+    const a = index / steps * Math.PI * 2;
+    const b = (index + 1) / steps * Math.PI * 2;
+    fills.push({
+      featureId,
+      kind,
+      color,
+      points: [
+        center,
+        [center[0] + Math.cos(a) * radius, center[1] + Math.sin(a) * radius],
+        [center[0] + Math.cos(b) * radius, center[1] + Math.sin(b) * radius],
+      ],
+      bounds: [center[0] - radius, center[1] - radius, center[0] + radius, center[1] + radius],
+    });
+  }
+}
+
+function appendPolygonFan(fills, featureId, kind, points, color) {
+  const anchor = points[0];
+  const bounds = pointsBounds(points);
+  for (let index = 2; index < points.length; index += 1) {
+    fills.push({ featureId, kind, color, points: [anchor, points[index - 1], points[index]], bounds });
+  }
+}
+
+function appendStyledSegment(segments, segment, a, b) {
+  const bounds = segmentBounds(a, b, segment.widthMm || 0.15);
+  const style = segment.lineStyle || "DEFAULT";
+  if (!["DASH", "DASHED", "DOT", "DOTTED", "DASHDOT", "DASH_DOT"].includes(style)) {
+    segments.push({ ...segment, a, b, bounds });
+    return;
+  }
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const length = Math.hypot(dx, dy);
+  if (length < 1e-6) return;
+  const ux = dx / length;
+  const uy = dy / length;
+  const unit = Math.max(segment.widthMm * 4, 0.45);
+  const pattern = style.includes("DOT")
+    ? [unit * 0.8, unit * 0.75, unit * 3.0, unit * 0.75]
+    : [unit * 3.0, unit * 1.5];
+  let offset = 0;
+  let patternIndex = 0;
+  while (offset < length) {
+    const span = Math.min(pattern[patternIndex % pattern.length], length - offset);
+    if (patternIndex % 2 === 0) {
+      const start = [a[0] + ux * offset, a[1] + uy * offset];
+      const end = [a[0] + ux * (offset + span), a[1] + uy * (offset + span)];
+      segments.push({ ...segment, a: start, b: end, bounds: segmentBounds(start, end, segment.widthMm || 0.15) });
+    }
+    offset += span;
+    patternIndex += 1;
+  }
+}
+
+function appendCircle(segments, segment, center, radius) {
   const steps = 32;
   for (let index = 0; index < steps; index += 1) {
     const a = index / steps * Math.PI * 2;
     const b = (index + 1) / steps * Math.PI * 2;
     segments.push({
-      featureId,
-      kind,
-      widthMm,
+      ...segment,
       a: [center[0] + Math.cos(a) * radius, center[1] + Math.sin(a) * radius],
       b: [center[0] + Math.cos(b) * radius, center[1] + Math.sin(b) * radius],
+      bounds: [center[0] - radius, center[1] - radius, center[0] + radius, center[1] + radius],
     });
   }
 }
 
+function pointsBounds(points, pad = 0) {
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  for (const point of points || []) {
+    left = Math.min(left, point[0]);
+    top = Math.min(top, point[1]);
+    right = Math.max(right, point[0]);
+    bottom = Math.max(bottom, point[1]);
+  }
+  if (!Number.isFinite(left)) return [0, 0, 0, 0];
+  return [left - pad, top - pad, right + pad, bottom + pad];
+}
+
+function segmentBounds(a, b, widthMm = 0) {
+  const pad = Math.max(0.05, widthMm * 0.5);
+  return [
+    Math.min(a[0], b[0]) - pad,
+    Math.min(a[1], b[1]) - pad,
+    Math.max(a[0], b[0]) + pad,
+    Math.max(a[1], b[1]) + pad,
+  ];
+}
+
+function intersectsBounds(a, b) {
+  if (!a || !b) return true;
+  return a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+}
+
+function buildSpatialIndex(geometry) {
+  const index = {
+    cellSize: VECTOR_TILE_SIZE_MM,
+    cells: new Map(),
+    segments: geometry.segments || [],
+    fills: geometry.fills || [],
+    images: geometry.images || [],
+    queryId: 0,
+  };
+  for (const item of index.segments) addSpatialItem(index, "segments", item);
+  for (const item of index.fills) addSpatialItem(index, "fills", item);
+  for (const item of index.images) addSpatialItem(index, "images", item);
+  return index;
+}
+
+function addSpatialItem(index, bucketName, item) {
+  const bounds = item.bounds;
+  if (!bounds) return;
+  const minX = Math.floor(bounds[0] / index.cellSize);
+  const maxX = Math.floor(bounds[2] / index.cellSize);
+  const minY = Math.floor(bounds[1] / index.cellSize);
+  const maxY = Math.floor(bounds[3] / index.cellSize);
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      const key = `${x}:${y}`;
+      let cell = index.cells.get(key);
+      if (!cell) {
+        cell = { segments: [], fills: [], images: [] };
+        index.cells.set(key, cell);
+      }
+      cell[bucketName].push(item);
+    }
+  }
+}
+
+function querySpatialIndex(index, bounds) {
+  if (!index) return { segments: [], fills: [], images: [] };
+  index.queryId = (index.queryId || 0) + 1;
+  const queryId = index.queryId;
+  const result = { segments: [], fills: [], images: [] };
+  const minX = Math.floor(bounds[0] / index.cellSize);
+  const maxX = Math.floor(bounds[2] / index.cellSize);
+  const minY = Math.floor(bounds[1] / index.cellSize);
+  const maxY = Math.floor(bounds[3] / index.cellSize);
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      const cell = index.cells.get(`${x}:${y}`);
+      if (!cell) continue;
+      collectSpatialItems(cell.segments, result.segments, queryId, "segments");
+      collectSpatialItems(cell.fills, result.fills, queryId, "fills");
+      collectSpatialItems(cell.images, result.images, queryId, "images");
+    }
+  }
+  return result;
+}
+
+function collectSpatialItems(items, output, queryId, bucketName) {
+  const marker = `_${bucketName}QueryId`;
+  for (const item of items) {
+    if (item[marker] === queryId) continue;
+    item[marker] = queryId;
+    output.push(item);
+  }
+}
+
 function shouldClosePolyline(primitive) {
-  return ["plotpoly", "polygon", "polyline", "fill"].includes(String(primitive.kind || ""));
+  const kind = String(primitive.kind || "");
+  const filled = String(primitive.fill || "").toUpperCase() === "FILLED_SHAPE";
+  if (filled || primitive.closed === true) return true;
+  if (["polygon", "fill"].includes(kind)) return true;
+  const points = primitive.pointsMm || [];
+  if (points.length >= 3) {
+    const first = points[0];
+    const last = points[points.length - 1];
+    return Math.hypot(first[0] - last[0], first[1] - last[1]) < 1e-6;
+  }
+  return false;
 }
 
 function isElectricalFeature(feature) {
@@ -1019,6 +1633,17 @@ function featurePickPriority(feature) {
   return 10;
 }
 
+function isBackgroundOrPageFeature(feature) {
+  const kind = String(feature?.kind || "");
+  const semantic = String(feature?.semanticRole || "");
+  if (kind === "page" || kind === "sheet_header") return true;
+  if (kind === "graphic_rect" && semantic === "graphic_rect" && !feature?.netUid && !feature?.componentUid) {
+    const bounds = feature.boundsMm || [];
+    return (bounds[2] - bounds[0]) > 150 && (bounds[3] - bounds[1]) > 120;
+  }
+  return false;
+}
+
 function parseColor(color) {
   if (!color || typeof color !== "string") return null;
   const value = color.trim();
@@ -1036,7 +1661,11 @@ function parseColor(color) {
 
 function vectorColor(feature, primitiveKind, sourceColor = "") {
   const parsed = parseColor(sourceColor || feature?.color || "");
+  if (feature?.dnp && ["symbol_reference", "symbol_value", "symbol_text"].includes(String(feature?.kind || ""))) {
+    return [0.50, 0.52, 0.54, 0.56];
+  }
   if (parsed) return parsed;
+  if (feature?.dnp) return [0.50, 0.52, 0.54, 0.56];
   if (isElectricalFeature(feature)) return [0.12, 0.56, 0.2, 0.96];
   if (feature?.kind === "pin_name") return [0.0, 0.28, 0.31, 0.96];
   if (feature?.kind === "pin_number") return [0.45, 0.17, 0.16, 0.96];
@@ -1069,17 +1698,52 @@ function appendStrokeQuad(values, a, b, width, color) {
   for (const point of quad) values.push(point[0], point[1], ...color);
 }
 
+function appendFilledTriangle(values, a, b, c, color) {
+  values.push(a[0], a[1], ...color);
+  values.push(b[0], b[1], ...color);
+  values.push(c[0], c[1], ...color);
+}
+
+function writeVectorVertex(values, offset, point, color) {
+  values[offset++] = point[0];
+  values[offset++] = point[1];
+  values[offset++] = color[0];
+  values[offset++] = color[1];
+  values[offset++] = color[2];
+  values[offset++] = color[3];
+  return offset;
+}
+
+function writeStrokeQuad(values, offset, a, b, width, color) {
+  const quad = strokeQuadPoints(a, b, width);
+  if (!quad) return offset;
+  for (const point of quad) offset = writeVectorVertex(values, offset, point, color);
+  return offset;
+}
+
+function writeFilledTriangle(values, offset, a, b, c, color) {
+  offset = writeVectorVertex(values, offset, a, color);
+  offset = writeVectorVertex(values, offset, b, color);
+  offset = writeVectorVertex(values, offset, c, color);
+  return offset;
+}
+
 function strokeQuadPoints(a, b, width) {
   const dx = b[0] - a[0];
   const dy = b[1] - a[1];
   const length = Math.hypot(dx, dy);
   if (length < 1e-6) return null;
-  const nx = -dy / length * width * 0.5;
-  const ny = dx / length * width * 0.5;
-  const p0 = [a[0] + nx, a[1] + ny];
-  const p1 = [a[0] - nx, a[1] - ny];
-  const p2 = [b[0] + nx, b[1] + ny];
-  const p3 = [b[0] - nx, b[1] - ny];
+  const half = width * 0.5;
+  const tx = dx / length * half;
+  const ty = dy / length * half;
+  const nx = -dy / length * half;
+  const ny = dx / length * half;
+  const start = [a[0] - tx, a[1] - ty];
+  const end = [b[0] + tx, b[1] + ty];
+  const p0 = [start[0] + nx, start[1] + ny];
+  const p1 = [start[0] - nx, start[1] - ny];
+  const p2 = [end[0] + nx, end[1] + ny];
+  const p3 = [end[0] - nx, end[1] - ny];
   return [p0, p1, p2, p2, p1, p3];
 }
 
@@ -1091,6 +1755,62 @@ function pointSegmentDistance(point, a, b) {
   const x = a[0] + dx * t;
   const y = a[1] + dy * t;
   return Math.hypot(point[0] - x, point[1] - y);
+}
+
+function clipSegmentOutsideBounds(segment, bounds) {
+  const [left, top, right, bottom] = bounds;
+  const [ax, ay] = segment.a;
+  const [bx, by] = segment.b;
+  const eps = 1e-6;
+  const make = (a, b) => ({ ...segment, a, b });
+
+  if (Math.abs(ay - by) <= eps) {
+    const y = ay;
+    if (y < top - eps || y > bottom + eps) return [segment];
+    const minX = Math.min(ax, bx);
+    const maxX = Math.max(ax, bx);
+    const overlapStart = Math.max(minX, left);
+    const overlapEnd = Math.min(maxX, right);
+    if (overlapEnd <= overlapStart + eps) return [segment];
+    const parts = [];
+    const ascending = ax <= bx;
+    if (minX < overlapStart - eps) {
+      const a = ascending ? [minX, y] : [overlapStart, y];
+      const b = ascending ? [overlapStart, y] : [minX, y];
+      parts.push(make(a, b));
+    }
+    if (overlapEnd < maxX - eps) {
+      const a = ascending ? [overlapEnd, y] : [maxX, y];
+      const b = ascending ? [maxX, y] : [overlapEnd, y];
+      parts.push(make(a, b));
+    }
+    return parts;
+  }
+
+  if (Math.abs(ax - bx) <= eps) {
+    const x = ax;
+    if (x < left - eps || x > right + eps) return [segment];
+    const minY = Math.min(ay, by);
+    const maxY = Math.max(ay, by);
+    const overlapStart = Math.max(minY, top);
+    const overlapEnd = Math.min(maxY, bottom);
+    if (overlapEnd <= overlapStart + eps) return [segment];
+    const parts = [];
+    const ascending = ay <= by;
+    if (minY < overlapStart - eps) {
+      const a = ascending ? [x, minY] : [x, overlapStart];
+      const b = ascending ? [x, overlapStart] : [x, minY];
+      parts.push(make(a, b));
+    }
+    if (overlapEnd < maxY - eps) {
+      const a = ascending ? [x, overlapEnd] : [x, maxY];
+      const b = ascending ? [x, maxY] : [x, overlapEnd];
+      parts.push(make(a, b));
+    }
+    return parts;
+  }
+
+  return [segment];
 }
 
 function writePickVertex(view, index, point, featureId) {
@@ -1108,4 +1828,11 @@ function writePickStrokeQuad(view, index, a, b, width, featureId) {
     index += 1;
   }
   return index;
+}
+
+function writePickTriangle(view, index, a, b, c, featureId) {
+  writePickVertex(view, index, a, featureId);
+  writePickVertex(view, index + 1, b, featureId);
+  writePickVertex(view, index + 2, c, featureId);
+  return index + 3;
 }

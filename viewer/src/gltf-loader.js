@@ -12,7 +12,7 @@ const io = new WebIO()
 
 export async function loadGltf(url, options = {}) {
   await MeshoptDecoder.ready;
-  const response = await fetch(url, { cache: "no-store" });
+  const response = await fetch(url, { cache: options.fetchCache || "default" });
   if (!response.ok) throw new Error(`Failed to load ${url}: ${response.status}`);
   const bytes = new Uint8Array(await response.arrayBuffer());
   const document = await io.readBinary(bytes);

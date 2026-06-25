@@ -68,7 +68,10 @@ const scene = {
   tiles: new Map(),
   loaded: new Set(),
   loading: new Map(),
+  failed: new Map(),
   componentFeatures: new Map(),
+  layerZOffsets: new Float32Array(256),
+  layerZOffsetSignature: "",
 };
 
 const compareAnimation = {
@@ -188,7 +191,7 @@ async function loadSchematicWorld() {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, { cache: "no-store" });
+  const response = await fetch(url, { cache: "default" });
   if (!response.ok) throw new Error(`Failed to load ${url}: ${response.status}`);
   return response.json();
 }
@@ -205,21 +208,30 @@ async function loadTile(tile) {
   if (scene.loaded.has(tile.id)) return;
   if (scene.loading.has(tile.id)) return scene.loading.get(tile.id);
   const promise = (async () => {
-    const loaded = await loadGltf(new URL(tile.path, scene.manifestUrl).toString());
-    state.loadedBytes += loaded.byteLength;
-    const layer = scene.layers.find((item) => Number(item.id) === Number(tile.layerId));
-    for (const primitive of loaded.primitives) {
-      renderer.addPrimitive(primitive, {
-        kind: "copper",
-        layerId: Number(tile.layerId),
-        color: layerColor(layer),
-        baseZ: Number(layer?.z_mm || 0) / 1000,
-        material: { baseColor: [1, 1, 1, 1], metallic: 0.78, roughness: 0.32 },
-      });
-      state.triangles += primitive.indices.length / 3;
+    try {
+      const loaded = await loadGltf(new URL(tile.path, scene.manifestUrl).toString());
+      state.loadedBytes += loaded.byteLength;
+      const layer = scene.layers.find((item) => Number(item.id) === Number(tile.layerId));
+      for (const primitive of loaded.primitives) {
+        renderer.addPrimitive(primitive, {
+          kind: "copper",
+          layerId: Number(tile.layerId),
+          color: layerColor(layer),
+          baseZ: Number(layer?.z_mm || 0) / 1000,
+          material: { baseColor: [1, 1, 1, 1], metallic: 0.78, roughness: 0.32 },
+        });
+        state.triangles += primitive.indices.length / 3;
+      }
+      scene.loaded.add(tile.id);
+      scene.failed.delete(tile.id);
+    } catch (error) {
+      const previous = scene.failed.get(tile.id) || { count: 0, message: "" };
+      scene.failed.set(tile.id, { count: previous.count + 1, message: error?.message || String(error) });
+      console.warn(`Failed to load tile ${tile.id}`, error);
+      throw error;
+    } finally {
+      scene.loading.delete(tile.id);
     }
-    scene.loaded.add(tile.id);
-    scene.loading.delete(tile.id);
   })();
   scene.loading.set(tile.id, promise);
   return promise;
@@ -416,17 +428,21 @@ function frame(now) {
 }
 
 function stackupOffsets() {
-  const output = new Float32Array(256);
   const bbox = scene.manifest.bbox;
   const diagonal = Math.hypot(
     (bbox.max[0] - bbox.min[0]) * 1000,
     (bbox.max[2] - bbox.min[2]) * 1000,
   );
   const gap = state.separation * state.separation * clamp(diagonal * 0.12, 8, 25) / 1000;
+  const signature = `${state.separation}:${gap}:${scene.copperLayers.length}`;
+  if (scene.layerZOffsetSignature === signature) return scene.layerZOffsets;
+  const output = scene.layerZOffsets;
+  output.fill(0);
   const middle = (scene.copperLayers.length - 1) / 2;
   scene.copperLayers.forEach((layer, index) => {
     output[Number(layer.id)] = (middle - index) * gap;
   });
+  scene.layerZOffsetSignature = signature;
   return output;
 }
 

@@ -4,12 +4,18 @@ import unittest
 
 from pipeline.topology_compiler.schematic_scene import (
     SCHEMA,
+    _inset_label_text_primitive,
     _operation_to_primitive,
     _operation_descriptors,
     _pin_lookup_indexes,
     _polyline_bounds,
     _page_chunks,
     _symbol_owner_features,
+    _native_preview_svg,
+    _native_overlay_svg,
+    _visual_regression_page_report,
+    _apply_text_length_adjust,
+    _schematic_text_length_mm,
     deterministic_feature_ids,
     stable_feature_key,
 )
@@ -101,8 +107,128 @@ class SchematicSceneSchemaTests(unittest.TestCase):
         self.assertIsNone(primitive)
         self.assertEqual(unsupported, "Unsupported")
 
+    def test_arc_three_point_is_tessellated_at_build_time(self):
+        primitive, unsupported = _operation_to_primitive(
+            FakeOperation(
+                {
+                    "kind": "ArcThreePoint",
+                    "start_x": 0,
+                    "start_y": 0,
+                    "mid_x": 1_000_000,
+                    "mid_y": -1_000_000,
+                    "end_x": 2_000_000,
+                    "end_y": 0,
+                    "width_nm": 152_400,
+                    "stroke_color": "#840000FF",
+                    "line_style": "DASH",
+                }
+            ),
+            7,
+        )
+
+        self.assertIsNone(unsupported)
+        self.assertTrue(primitive["tessellated"])
+        self.assertGreater(len(primitive["pointsMm"]), 3)
+        self.assertEqual(primitive["lineStyle"], "DASH")
+        self.assertEqual(primitive["color"], "#840000FF")
+
+    def test_thick_segment_preserves_start_end_and_color(self):
+        primitive, unsupported = _operation_to_primitive(
+            FakeOperation(
+                {
+                    "kind": "ThickSegment",
+                    "start_x": 1_000_000,
+                    "start_y": 2_000_000,
+                    "end_x": 3_000_000,
+                    "end_y": 4_000_000,
+                    "width_nm": 457_200,
+                    "stroke_color": "#DC090DD9",
+                }
+            ),
+            7,
+        )
+
+        self.assertIsNone(unsupported)
+        self.assertEqual(primitive["start_xMm"], 1.0)
+        self.assertEqual(primitive["end_yMm"], 4.0)
+        self.assertEqual(primitive["widthMm"], 0.4572)
+        self.assertEqual(primitive["color"], "#DC090DD9")
+
+    def test_filled_plot_polygon_is_triangulated_at_build_time(self):
+        primitive, unsupported = _operation_to_primitive(
+            FakeOperation(
+                {
+                    "kind": "PlotPoly",
+                    "points": [
+                        [0, 0],
+                        [4_000_000, 0],
+                        [4_000_000, 1_000_000],
+                        [2_000_000, 500_000],
+                        [0, 1_000_000],
+                    ],
+                    "fill": "FILLED_SHAPE",
+                    "fill_color": "#123456FF",
+                }
+            ),
+            7,
+        )
+
+        self.assertIsNone(unsupported)
+        self.assertIn(primitive["triangulation"], {"earcut", "earclip-simple"})
+        self.assertGreaterEqual(len(primitive["trianglesMm"]), 3)
+        self.assertEqual(primitive["fillColor"], "#123456FF")
+
+    def test_filled_polygon_with_hole_uses_build_time_triangulation(self):
+        primitive, unsupported = _operation_to_primitive(
+            FakeOperation(
+                {
+                    "kind": "PlotPoly",
+                    "contours": [
+                        [[0, 0], [6_000_000, 0], [6_000_000, 6_000_000], [0, 6_000_000]],
+                        [[2_000_000, 2_000_000], [4_000_000, 2_000_000], [4_000_000, 4_000_000], [2_000_000, 4_000_000]],
+                    ],
+                    "fill": "FILLED_SHAPE",
+                }
+            ),
+            7,
+        )
+
+        self.assertIsNone(unsupported)
+        self.assertEqual(primitive.get("contourCount"), 2)
+        self.assertEqual(primitive.get("triangulation"), "earcut")
+        self.assertGreaterEqual(len(primitive["trianglesMm"]), 4)
+
+    def test_plot_image_becomes_native_image_primitive(self):
+        primitive, unsupported = _operation_to_primitive(
+            FakeOperation(
+                {
+                    "kind": "PlotImage",
+                    "x": 1_000_000,
+                    "y": 2_000_000,
+                    "width_nm": 3_000_000,
+                    "height_nm": 4_000_000,
+                    "image_data_b64": "iVBORw0KGgo=",
+                    "image_format": "png",
+                }
+            ),
+            7,
+        )
+
+        self.assertIsNone(unsupported)
+        self.assertEqual(primitive["kind"], "plotimage")
+        self.assertEqual(primitive["centerXMm"], 1.0)
+        self.assertEqual(primitive["centerYMm"], 2.0)
+        self.assertEqual(primitive["boundsMm"], [-0.5, 0.0, 2.5, 4.0])
+        self.assertEqual(primitive["imageFormat"], "png")
+
     def test_render_block_markers_are_ignored(self):
         primitive, unsupported = _operation_to_primitive(FakeOperation({"kind": "StartBlock"}), 7)
+
+        self.assertIsNone(primitive)
+        self.assertIsNone(unsupported)
+
+    def test_empty_text_is_ignored_not_reported_unsupported(self):
+        primitive, unsupported = _operation_to_primitive(FakeOperation({"kind": "TextEmpty"}), 7)
 
         self.assertIsNone(primitive)
         self.assertIsNone(unsupported)
@@ -215,11 +341,60 @@ class SchematicSceneSchemaTests(unittest.TestCase):
         self.assertNotEqual(normal["polylinesMm"][0][0], mirrored["polylinesMm"][0][0])
         self.assertNotEqual(normal["polylinesMm"][0][0], italic["polylinesMm"][0][0])
 
+    def test_newstroke_italic_uses_y_down_compensation(self):
+        primitive = self._text_primitive(text="ABC", italic=True)
+        normal = self._text_primitive(text="ABC", italic=False)
+
+        self.assertEqual(len(primitive["polylinesMm"]), len(normal["polylinesMm"]))
+        self.assertGreater(
+            primitive["polylinesMm"][0][0][0],
+            normal["polylinesMm"][0][0][0],
+        )
+
     def test_newstroke_multiline_emits_multiple_lines(self):
         single = self._text_primitive(text="R1")
         multi = self._text_primitive(text="R1\nC2")
 
         self.assertGreater(len(multi["polylinesMm"]), len(single["polylinesMm"]))
+        self.assertTrue(multi["style"]["multiline"])
+        self.assertEqual(multi["style"]["lineCount"], 2)
+
+    def test_label_text_inset_moves_left_aligned_hierarchical_text_inward(self):
+        primitive = self._text_primitive(text="SDA", h_align="left")
+        before = primitive["boundsMm"][0]
+
+        _inset_label_text_primitive(primitive, "hierarchical_label")
+
+        self.assertGreater(primitive["boundsMm"][0], before)
+
+    def test_global_label_text_keeps_plotter_position(self):
+        primitive = self._text_primitive(text="SDA", h_align="left")
+        before = list(primitive["boundsMm"])
+
+        _inset_label_text_primitive(primitive, "global_label")
+
+        self.assertEqual(primitive["boundsMm"], before)
+
+    def test_newstroke_text_length_matches_kicad_svg_metric(self):
+        primitive = self._text_primitive(text="PFE_MAC2_RXD3", h_align="left")
+        bounds = _polyline_bounds(primitive["polylinesMm"])
+        target_width = _schematic_text_length_mm("PFE_MAC2_RXD3", 1_270_000)
+
+        self.assertAlmostEqual(bounds[2] - bounds[0], target_width, delta=0.12)
+        self.assertEqual(primitive["style"]["lengthAdjust"], "spacingAndGlyphs")
+
+    def test_text_length_adjust_scales_height_with_width(self):
+        adjusted = _apply_text_length_adjust(
+            [[(0.0, 0.0), (10.0, 0.0), (10.0, 2.0), (0.0, 2.0)]],
+            target_length_mm=5.0,
+            angle_deg=0,
+            h_align="left",
+            v_align="bottom",
+        )
+        bounds = _polyline_bounds([[[x, y] for x, y in polyline] for polyline in adjusted])
+
+        self.assertAlmostEqual(bounds[2] - bounds[0], 5.0)
+        self.assertAlmostEqual(bounds[3] - bounds[1], 1.0)
 
     def test_text_feature_ids_are_deterministic(self):
         key = stable_feature_key("/root/repeated", "text-source", 3, "text", 0)
@@ -362,6 +537,15 @@ class SchematicSceneSchemaTests(unittest.TestCase):
         self.assertEqual(by_kind["pin"]["pcbPadId"], "pad-r1-1")
         self.assertEqual(by_kind["pin"]["componentUid"], "cmp-1")
 
+        dnp_record = FakeSymbolRecord(
+            [FakeOperation({"kind": "Line", "x1": 0, "y1": 0, "x2": 1_000_000, "y2": 1_000_000})],
+            extras={"reference": "R1", "value": "10k", "dnp": True},
+        )
+        dnp_owners = _symbol_owner_features(
+            page["id"], page["sheetInstancePath"], dnp_record, 1, parent, pin_lookup, components
+        )
+        self.assertTrue(next(feature for feature in dnp_owners if feature["kind"] == "symbol_body")["dnp"])
+
     def test_symbol_operation_descriptors_assign_pin_subfeatures(self):
         page = {"id": "page-0001", "sheetInstancePath": "/root", "sourceWidthMm": 50, "sourceHeightMm": 30}
         parent = {
@@ -402,6 +586,27 @@ class SchematicSceneSchemaTests(unittest.TestCase):
         self.assertEqual(descriptors[2]["sourceId"], "pin-uuid")
         self.assertEqual(descriptors[2]["parentStableKey"], "/root | pin-uuid | 0 | pin | 0")
         self.assertEqual(descriptors[2]["metadata"]["netName"], "VCC")
+
+    def test_dnp_metadata_propagates_to_symbol_subfeatures(self):
+        page = {"id": "page-0001", "sheetInstancePath": "/root", "sourceWidthMm": 50, "sourceHeightMm": 30}
+        parent = {
+            "id": 10,
+            "stableKey": "/root | symbol-uuid | 0 | record | 0",
+            "pageId": "page-0001",
+            "sheetInstancePath": "/root",
+            "sourceId": "symbol-uuid",
+            "uuid": "symbol-uuid",
+            "objectId": "Device:R",
+            "kind": "symbol_instance",
+            "reference": "R1",
+            "value": "10k",
+            "dnp": True,
+        }
+        record = FakeSymbolRecord([FakeOperation({"kind": "Text", "text": "R1", "x": 0, "y": 0})])
+
+        descriptors = _operation_descriptors(page, record, 1, parent, {"bySvgId": {}, "byDesignatorPin": {}}, {})
+
+        self.assertTrue(descriptors[0]["metadata"]["dnp"])
 
     def test_repeated_hierarchy_symbol_and_pin_keys_are_instance_scoped(self):
         symbol_uuid = "same-symbol"
@@ -467,6 +672,88 @@ class SchematicSceneSchemaTests(unittest.TestCase):
         self.assertEqual(primitive_features[0]["kind"], "pin")
         self.assertEqual(primitive_features[0]["parentFeatureId"], 11)
         self.assertEqual(primitive_features[0]["netUid"], "net-1")
+
+    def test_native_preview_svg_renders_vectors_images_and_fills(self):
+        page = {
+            "id": "page-0001",
+            "name": "Root",
+            "svg": "pages/0001-Root.svg",
+            "sourceWidthMm": 100,
+            "sourceHeightMm": 80,
+        }
+        preview = _native_preview_svg(
+            page,
+            [
+                {
+                    "featureId": 1,
+                    "kind": "line",
+                    "x1Mm": 1,
+                    "y1Mm": 2,
+                    "x2Mm": 9,
+                    "y2Mm": 2,
+                    "widthMm": 0.15,
+                    "color": "#008000FF",
+                },
+                {
+                    "featureId": 2,
+                    "kind": "plotpoly",
+                    "trianglesMm": [[[0, 0], [1, 0], [0, 1]]],
+                    "fillColor": "#840000FF",
+                },
+                {
+                    "featureId": 3,
+                    "kind": "plotimage",
+                    "xMm": 10,
+                    "yMm": 12,
+                    "widthMm": 20,
+                    "heightMm": 8,
+                    "image": {"path": "images/demo.png"},
+                },
+            ],
+        )
+
+        self.assertIn("<line", preview)
+        self.assertIn("<polygon", preview)
+        self.assertIn('<image href="../images/demo.png"', preview)
+
+    def test_native_overlay_references_source_svg_and_preview(self):
+        page = {
+            "id": "page-0001",
+            "name": "Root",
+            "svg": "pages/0001-Root.svg",
+            "sourceWidthMm": 100,
+            "sourceHeightMm": 80,
+        }
+        overlay = _native_overlay_svg(page, [{"featureId": 1, "kind": "line", "x1Mm": 0, "y1Mm": 0, "x2Mm": 1, "y2Mm": 1}])
+
+        self.assertIn('<image href="../pages/0001-Root.svg"', overlay)
+        self.assertIn('id="native-vector-preview"', overlay)
+
+    def test_visual_regression_report_is_deterministic_and_counts_coverage(self):
+        page = {
+            "id": "page-0001",
+            "name": "Root",
+            "svg": "pages/0001-Root.svg",
+            "sourceWidthMm": 100,
+            "sourceHeightMm": 80,
+        }
+        primitives = [
+            {"featureId": 2, "kind": "text_strokes", "semanticRole": "label", "boundsMm": [1, 1, 3, 2]},
+            {"featureId": 1, "kind": "line", "semanticRole": "wire", "boundsMm": [0, 0, 5, 0]},
+        ]
+        unsupported = [{"operationKind": "BezierCurve", "recordKind": "graphic"}]
+        svg = '<svg><path d="M0 0"/><text>R1</text></svg>'
+
+        first = _visual_regression_page_report(page, primitives, unsupported, svg)
+        second = _visual_regression_page_report(page, primitives, unsupported, svg)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["nativePrimitiveCount"], 2)
+        self.assertEqual(first["nativePrimitiveCounts"], {"line": 1, "text_strokes": 1})
+        self.assertEqual(first["nativeSemanticCounts"], {"label": 1, "wire": 1})
+        self.assertEqual(first["sourceSvgTagCounts"]["path"], 1)
+        self.assertEqual(first["unsupportedCounts"], {"BezierCurve": 1})
+        self.assertEqual(first["nativeBoundsMm"], [0, 0, 5, 2])
 
 
 if __name__ == "__main__":
