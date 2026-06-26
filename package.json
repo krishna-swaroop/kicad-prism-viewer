@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "build:viewer": "esbuild viewer/src/main.js --bundle --minify --format=iife --platform=browser --external:node:fs --external:node:path --outfile=viewer/app.js",
-    "test:gltf": "node --test tools/semantic-gltf/*.test.mjs"
+    "test:gltf": "node --test tools/semantic-gltf/*.test.mjs",
+    "bench:schematic-dom": "node tools/schematic-dom-benchmark.mjs"
   },
   "dependencies": {
     "@gltf-transform/core": "^4.2.1",

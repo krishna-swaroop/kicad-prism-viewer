@@ -1156,6 +1156,80 @@ def _pin_lookup_indexes(
     return {"bySvgId": by_svg_id, "byDesignatorPin": by_designator_pin}
 
 
+def _topology_graphical_net_candidates(topology: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    if not topology:
+        return {}
+    candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for net in topology.get("nets", []) or []:
+        payload = {
+            "uid": str(net.get("uid") or ""),
+            "name": str(net.get("name") or ""),
+            "net_class": str(net.get("net_class") or ""),
+        }
+        if not payload["uid"]:
+            continue
+        for graphical_id in net.get("graphical_ids", []) or []:
+            if not isinstance(graphical_id, str) or not graphical_id or graphical_id.startswith("{"):
+                continue
+            candidates[graphical_id].append(payload)
+    indexes = topology.get("indexes", {}) or {}
+    object_to_net = indexes.get("object_to_net", {}) or {}
+    nets_by_uid = {str(net.get("uid") or ""): net for net in topology.get("nets", []) or []}
+    for source_id, object_id_or_ids in (indexes.get("source_svg_to_object", {}) or {}).items():
+        object_ids = object_id_or_ids if isinstance(object_id_or_ids, list) else [object_id_or_ids]
+        for object_id in object_ids:
+            net_uid = str(object_to_net.get(str(object_id)) or "")
+            net = nets_by_uid.get(net_uid)
+            if not net:
+                continue
+            candidates[str(source_id)].append(
+                {
+                    "uid": net_uid,
+                    "name": str(net.get("name") or ""),
+                    "net_class": str(net.get("net_class") or ""),
+                }
+            )
+    return {key: _dedupe_net_candidates(value) for key, value in candidates.items()}
+
+
+def _dedupe_net_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        uid = str(candidate.get("uid") or "")
+        if uid:
+            output[uid] = candidate
+    return list(output.values())
+
+
+def _page_topology_svg_to_net(
+    topology_candidates: dict[str, list[dict[str, Any]]],
+    *,
+    sheet_name: str,
+    source_path: str,
+) -> dict[str, dict[str, Any]]:
+    resolved: dict[str, dict[str, Any]] = {}
+    context_tokens = [
+        token
+        for token in {
+            sheet_name.lower(),
+            Path(source_path).stem.replace("_", " ").replace("-", " ").lower(),
+        }
+        if token
+    ]
+    for source_id, candidates in topology_candidates.items():
+        if len(candidates) == 1:
+            resolved[source_id] = candidates[0]
+            continue
+        matching = [
+            candidate
+            for candidate in candidates
+            if any(token and token in str(candidate.get("name") or "").replace("_", " ").replace("-", " ").lower() for token in context_tokens)
+        ]
+        if len(matching) == 1:
+            resolved[source_id] = matching[0]
+    return resolved
+
+
 def _symbol_body_key(sheet_instance_path: str, source_id: str) -> str:
     return stable_feature_key(sheet_instance_path, source_id, 0, "symbol_body", 0)
 
@@ -1725,6 +1799,7 @@ def build_schematic_scene(
     }
     component_by_designator = _component_indexes(design_payload, topology)
     pin_lookup = _pin_lookup_indexes(design_payload, topology, component_by_designator)
+    topology_graphical_nets = _topology_graphical_net_candidates(topology)
 
     for index, instance in enumerate(design.schematic_instances(), start=1):
         ir = design.to_schematic_instance_ir(instance)
@@ -1756,7 +1831,14 @@ def build_schematic_scene(
             profile="enriched",
         )
         view_indexes = enrichment.get("view_indexes", {})
-        svg_to_net = view_indexes.get("svg_to_net", {}) or {}
+        svg_to_net = {
+            **_page_topology_svg_to_net(
+                topology_graphical_nets,
+                sheet_name=sheet_name,
+                source_path=source_path,
+            ),
+            **(view_indexes.get("svg_to_net", {}) or {}),
+        }
         net_map = view_indexes.get("net_uid_to_svg", {}) or {}
         for net_uid in net_map:
             net_to_pages[str(net_uid)].add(page_id)
@@ -1864,6 +1946,9 @@ def build_schematic_scene(
                     "semanticRole": semantic_role,
                     "kind": descriptor.get("featureRole") or semantic_role,
                 }
+                if feature.get("netUid") and not primitive_feature.get("netUid"):
+                    primitive_feature["netUid"] = feature["netUid"]
+                    primitive_feature["netName"] = feature.get("netName", "")
                 bounds_mm = _operation_bounds(operation)
                 if primitive.get("boundsMm"):
                     bounds_mm = primitive["boundsMm"]

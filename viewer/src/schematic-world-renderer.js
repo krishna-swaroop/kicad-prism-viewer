@@ -104,6 +104,51 @@ struct Out { @builtin(position) position: vec4f };
   return vec4f(0.08, 1.0, 0.27, 0.96);
 }`;
 
+const NET_FLOW_SHADER = `
+struct Globals {
+  camera: vec4f,
+  viewport: vec2f,
+  activeNet: u32,
+  _pad: u32,
+};
+@group(0) @binding(0) var<uniform> globals: Globals;
+struct Out {
+  @builtin(position) position: vec4f,
+  @location(0) distance: f32,
+  @location(1) kind: f32,
+};
+@vertex fn vs(@location(0) world: vec2f, @location(1) flow: vec2f) -> Out {
+  let halfViewport = globals.viewport * globals.camera.z * 0.5;
+  let clip = vec2f(
+    (world.x - globals.camera.x) / halfViewport.x,
+    -(world.y - globals.camera.y) / halfViewport.y
+  );
+  var out: Out;
+  out.position = vec4f(clip, 0.05, 1.0);
+  out.distance = flow.x;
+  out.kind = flow.y;
+  return out;
+}
+@fragment fn fs(input: Out) -> @location(0) vec4f {
+  let selected = input.kind > 1.5;
+  let intersheet = input.kind > 0.5 && !selected;
+  let speed = select(0.62, 0.88, intersheet || selected);
+  let period = select(18.0, 28.0, intersheet || selected);
+  let phase = fract(input.distance / period - globals.camera.w * speed);
+  let dash = smoothstep(0.04, 0.13, phase) * (1.0 - smoothstep(0.38, 0.52, phase));
+  let intraBase = vec3f(0.94, 0.48, 0.12);
+  let intraDash = vec3f(1.0, 0.86, 0.24);
+  let interBase = vec3f(0.10, 0.46, 0.92);
+  let interDash = vec3f(0.42, 0.82, 1.0);
+  let selectedBase = vec3f(0.08, 1.0, 0.34);
+  let selectedDash = vec3f(0.86, 1.0, 0.72);
+  let base = select(select(intraBase, interBase, intersheet), selectedBase, selected);
+  let bright = select(select(intraDash, interDash, intersheet), selectedDash, selected);
+  let color = base + (bright - base) * dash;
+  let alpha = select(select(0.24, 0.30, intersheet) + dash * 0.54, 0.44 + dash * 0.50, selected);
+  return vec4f(color, alpha);
+}`;
+
 const VECTOR_SHADER = `
 struct Globals {
   camera: vec4f,
@@ -201,13 +246,19 @@ struct Out {
   return input.featureId;
 }`;
 
-const NATIVE_DETAIL_PAGE_PIXELS = 760;
+const NATIVE_DETAIL_BASE_ENTER_PX_PER_MM = 6.2;
+const NATIVE_DETAIL_BASE_EXIT_PX_PER_MM = 4.6;
+const NATIVE_DETAIL_BASE_PREFETCH_PX_PER_MM = 3.8;
 const MAX_VECTOR_FLOATS = 4 * 1024 * 1024;
 const MAX_VECTOR_VERTICES = Math.floor(MAX_VECTOR_FLOATS / 6);
 const MAX_VECTOR_DRAW_FLOATS = MAX_VECTOR_VERTICES * 6;
 const MAX_PICK_VERTICES = 512 * 1024;
+const MAX_NET_FLOW_FLOATS = 512 * 1024;
+const MAX_NET_TRACKING_ANCHORS_PER_PAGE = 96;
+const MAX_NET_TRACKING_PAGES = 96;
 const VECTOR_TILE_SIZE_MM = 18;
 const MAX_RESIDENT_VECTOR_BYTES = 96 * 1024 * 1024;
+const MAX_CONCURRENT_VECTOR_LOADS = 2;
 
 export class SchematicWorldRenderer {
   static async create(canvas, manifestUrl) {
@@ -215,14 +266,14 @@ export class SchematicWorldRenderer {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("No WebGPU adapter is available");
     const device = await adapter.requestDevice();
-    const response = await fetch(manifestUrl, { cache: "no-store" });
+    const response = await fetch(manifestUrl, { cache: "default" });
     if (!response.ok) throw new Error(`Failed to load schematic manifest: ${response.status}`);
     const manifest = await response.json();
     if (!["prism.schematic_world_a0", "prism.schematic_vector_a0"].includes(manifest.schema)) {
       throw new Error(`Unsupported schematic scene schema: ${manifest.schema}`);
     }
     const featurePath = manifest.featureTable || manifest.features;
-    const featureResponse = await fetch(new URL(featurePath, manifestUrl), { cache: "no-store" });
+    const featureResponse = await fetch(new URL(featurePath, manifestUrl), { cache: "default" });
     if (!featureResponse.ok) throw new Error(`Failed to load schematic features: ${featureResponse.status}`);
     const features = normalizeFeatureTable(await featureResponse.json());
     return new SchematicWorldRenderer(canvas, device, manifestUrl, manifest, features);
@@ -243,6 +294,8 @@ export class SchematicWorldRenderer {
     this.context = canvas.getContext("webgpu");
     this.format = navigator.gpu.getPreferredCanvasFormat();
     this.context.configure({ device, format: this.format, alphaMode: "opaque" });
+    this.flowCanvas = null;
+    this.flowContext = null;
     this.globalBuffer = device.createBuffer({
       size: 48,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -263,7 +316,7 @@ export class SchematicWorldRenderer {
       primitive: { topology: "triangle-list" },
     });
     this.edgeLayout = device.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } }],
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }],
     });
     const edgeModule = device.createShaderModule({ code: EDGE_SHADER });
     this.edgePipeline = device.createRenderPipeline({
@@ -316,11 +369,45 @@ export class SchematicWorldRenderer {
       size: this.highlightBufferSize,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
+    const netFlowModule = device.createShaderModule({ code: NET_FLOW_SHADER });
+    this.netFlowPipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.edgeLayout] }),
+      vertex: {
+        module: netFlowModule,
+        entryPoint: "vs",
+        buffers: [{
+          arrayStride: 16,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x2" },
+            { shaderLocation: 1, offset: 8, format: "float32x2" },
+          ],
+        }],
+      },
+      fragment: {
+        module: netFlowModule,
+        entryPoint: "fs",
+        targets: [{
+          format: this.format,
+          blend: {
+            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+          },
+        }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+    this.netFlowBuffer = device.createBuffer({
+      size: MAX_NET_FLOW_FLOATS * 4,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
     this.globalUniformScratch = new Float32Array(12);
     this.pageUniformScratch = new Float32Array(8);
     this.imageUniformScratch = new Float32Array(8);
     this.vectorScratch = new Float32Array(MAX_VECTOR_FLOATS);
     this.highlightScratch = new Float32Array(this.highlightBufferSize / 4);
+    this.netFlowScratch = new Float32Array(MAX_NET_FLOW_FLOATS);
+    this.netTrackingCache = null;
+    this.selectedIntrasheetLinkIndex = -1;
     this.truncatedHighlightCount = 0;
     this.truncatedVectorCount = 0;
     this.frameSerial = 0;
@@ -356,6 +443,7 @@ export class SchematicWorldRenderer {
       size: MAX_VECTOR_FLOATS * 4,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
+    this.vectorBuffers = [this.vectorBuffer];
     const imageModule = device.createShaderModule({ code: IMAGE_SHADER });
     this.imagePipeline = device.createRenderPipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
@@ -403,6 +491,9 @@ export class SchematicWorldRenderer {
     this.pickPending = false;
     this.vectorChunks = new Map();
     this.failedVectorChunks = new Map();
+    this.nativeDetailState = new Map();
+    this.domDetailPageIds = new Set();
+    this.nativeDetailThresholds = new Map();
     this.residentVectorBytes = 0;
     this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", mipmapFilter: "linear" });
     this.placeholder = this.createSolidTexture([245, 247, 249, 255]);
@@ -496,7 +587,7 @@ export class SchematicWorldRenderer {
     if (this.loading.has(key)) return this.loading.get(key);
     const promise = (async () => {
       try {
-        const response = await fetch(new URL(path, this.manifestUrl), { cache: "no-store" });
+        const response = await fetch(new URL(path, this.manifestUrl), { cache: "default" });
         if (!response.ok) throw new Error(`Failed to load schematic image ${path}: ${response.status}`);
         const blob = await response.blob();
         const bitmap = await createImageBitmap(blob);
@@ -552,6 +643,21 @@ export class SchematicWorldRenderer {
       this.canvas.width = width;
       this.canvas.height = height;
     }
+    if (this.flowCanvas && (this.flowCanvas.width !== width || this.flowCanvas.height !== height)) {
+      this.flowCanvas.width = width;
+      this.flowCanvas.height = height;
+    }
+  }
+
+  setFlowOverlayCanvas(canvas) {
+    if (!canvas) return;
+    this.flowCanvas = canvas;
+    this.flowContext = canvas.getContext("webgpu");
+    this.flowContext.configure({
+      device: this.device,
+      format: this.format,
+      alphaMode: "premultiplied",
+    });
   }
 
   writeGlobals() {
@@ -559,7 +665,7 @@ export class SchematicWorldRenderer {
     floats[0] = this.center[0];
     floats[1] = this.center[1];
     floats[2] = this.scale;
-    floats[3] = 0;
+    floats[3] = performance.now() * 0.001;
     floats[4] = this.canvas.width;
     floats[5] = this.canvas.height;
     this.device.queue.writeBuffer(this.globalBuffer, 0, floats);
@@ -569,10 +675,63 @@ export class SchematicWorldRenderer {
     return page.widthMm / this.scale;
   }
 
+  pageSourcePixelsPerMm(page) {
+    const x = this.pagePixelWidth(page) / Math.max(1, page.sourceWidthMm || page.widthMm);
+    const y = (page.heightMm / this.scale) / Math.max(1, page.sourceHeightMm || page.heightMm);
+    return Math.min(x, y);
+  }
+
+  pageNativeDetailThresholds(page) {
+    const cached = this.nativeDetailThresholds.get(page.id);
+    if (cached) return cached;
+    const sourceWidth = Math.max(1, page.sourceWidthMm || page.widthMm);
+    const sourceHeight = Math.max(1, page.sourceHeightMm || page.heightMm);
+    const sourceArea = sourceWidth * sourceHeight;
+    const featureDensity = Math.max(0, page.featureCount || page.featureIds?.length || 0) / Math.max(1, sourceArea);
+    const densityBias = clamp(1 - featureDensity * 72, 0.84, 1.08);
+    const aspectBias = clamp(Math.sqrt(Math.max(sourceWidth, sourceHeight) / Math.max(1, Math.min(sourceWidth, sourceHeight))) / 1.18, 0.92, 1.14);
+    const enter = clamp(NATIVE_DETAIL_BASE_ENTER_PX_PER_MM * densityBias * aspectBias, 5.0, 7.4);
+    const thresholds = {
+      enter,
+      exit: clamp(Math.min(enter - 1.2, NATIVE_DETAIL_BASE_EXIT_PX_PER_MM * densityBias), 3.8, enter - 0.7),
+      prefetch: clamp(Math.min(enter - 2.0, NATIVE_DETAIL_BASE_PREFETCH_PX_PER_MM * densityBias), 3.0, enter - 1.0),
+    };
+    this.nativeDetailThresholds.set(page.id, thresholds);
+    return thresholds;
+  }
+
+  pageWantsNativeDetail(page) {
+    if (!this.pageHasNativeDetail(page)) return false;
+    const density = this.pageSourcePixelsPerMm(page);
+    const active = this.nativeDetailState.get(page.id) === true;
+    const thresholds = this.pageNativeDetailThresholds(page);
+    const threshold = active ? thresholds.exit : thresholds.enter;
+    const next = density >= threshold;
+    if (next !== active) this.nativeDetailState.set(page.id, next);
+    return next;
+  }
+
   pageNativeDetailReady(page) {
-    if (!this.pageHasNativeDetail(page) || this.pagePixelWidth(page) <= NATIVE_DETAIL_PAGE_PIXELS) return false;
+    if (this.domDetailPageIds.has(page.id)) return false;
+    if (!this.pageWantsNativeDetail(page)) return false;
     const chunk = this.vectorChunks.get(page.id);
-    return Boolean(chunk?.loaded && (chunk.segments?.length || chunk.fills?.length));
+    if (!chunk?.loaded || (!chunk.segments?.length && !chunk.fills?.length)) return false;
+    return this.visibleNativeImagesReady(page, chunk);
+  }
+
+  visibleNativeImagesReady(page, chunk) {
+    if (!chunk?.images?.length) return true;
+    const sourceBounds = this.sourceViewportBounds(page, 4);
+    let ready = true;
+    for (const image of chunk.images) {
+      if (!intersectsBounds(image.bounds, sourceBounds)) continue;
+      const resource = this.imageResources.get(image.path) || this.createImageResource(image.path);
+      if (!resource.loaded) {
+        ready = false;
+        void this.loadImageTexture(image.path).catch(() => {});
+      }
+    }
+    return ready;
   }
 
   visiblePages() {
@@ -638,7 +797,8 @@ export class SchematicWorldRenderer {
     for (const page of visible) {
       const resource = this.pageResources.get(page.id);
       const containsNet = this.activeNetUid && page.netUids.includes(this.activeNetUid);
-      const showNativeDetail = this.pageNativeDetailReady(page);
+      const showDomDetail = this.domDetailPageIds.has(page.id);
+      const showNativeDetail = !showDomDetail && this.pageNativeDetailReady(page);
       const values = this.pageUniformScratch;
       values[0] = page.worldX;
       values[1] = page.worldY;
@@ -647,7 +807,7 @@ export class SchematicWorldRenderer {
       values[4] = page.id === this.selectedPageId ? 1 : 0;
       values[5] = containsNet ? 1 : 0;
       values[6] = this.activeNetUid ? 1 : 0;
-      values[7] = showNativeDetail ? 1 : 0;
+      values[7] = showNativeDetail || showDomDetail ? 1 : 0;
       this.device.queue.writeBuffer(resource.uniform, 0, values);
       pass.setBindGroup(0, resource.bindGroup);
       pass.draw(6);
@@ -657,18 +817,17 @@ export class SchematicWorldRenderer {
         6144,
       );
       if (resource.textureWidth < wantedWidth * 0.82) void this.loadPageTexture(page, wantedWidth).catch(() => {});
-      if (this.pageHasNativeDetail(page) && this.pagePixelWidth(page) > NATIVE_DETAIL_PAGE_PIXELS) {
-        void this.loadPageVectors(page).catch(() => {});
-      }
     }
-    const vectorCount = this.writeVisibleVectors(visible);
-    if (vectorCount) {
-      pass.setPipeline(this.vectorPipeline);
-      pass.setBindGroup(0, this.edgeBindGroup);
-      pass.setVertexBuffer(0, this.vectorBuffer);
-      pass.draw(vectorCount);
-    }
+    this.scheduleVisibleVectorLoads(visible);
     this.drawVisibleImages(pass, visible);
+    this.drawVisibleVectors(pass, visible);
+    const flowCount = this.writeNetTrackingOverlay();
+    if (flowCount && !this.flowContext) {
+      pass.setPipeline(this.netFlowPipeline);
+      pass.setBindGroup(0, this.edgeBindGroup);
+      pass.setVertexBuffer(0, this.netFlowBuffer);
+      pass.draw(flowCount);
+    }
     const highlightCount = this.writeNetHighlights(visible);
     if (highlightCount) {
       pass.setPipeline(this.highlightPipeline);
@@ -678,15 +837,38 @@ export class SchematicWorldRenderer {
     }
     pass.end();
     this.device.queue.submit([encoder.finish()]);
+    this.renderFlowOverlay(flowCount);
     this.evictVectorChunks(visible);
     return visible;
+  }
+
+  renderFlowOverlay(flowCount) {
+    if (!this.flowContext) return;
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.flowContext.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: "clear",
+        storeOp: "store",
+      }],
+    });
+    if (flowCount) {
+      pass.setPipeline(this.netFlowPipeline);
+      pass.setBindGroup(0, this.edgeBindGroup);
+      pass.setVertexBuffer(0, this.netFlowBuffer);
+      pass.draw(flowCount);
+    }
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
   }
 
   drawVisibleImages(pass, visiblePages) {
     if (!this.isNativeScene) return;
     let pipelineSet = false;
     for (const page of visiblePages) {
-      if (!this.pageHasNativeDetail(page)) continue;
+      if (this.domDetailPageIds.has(page.id)) continue;
+      if (!this.pageNativeDetailReady(page)) continue;
       const chunk = this.vectorChunks.get(page.id);
       if (!chunk?.images?.length) continue;
       const sourceBounds = this.sourceViewportBounds(page, 4);
@@ -694,8 +876,8 @@ export class SchematicWorldRenderer {
         if (!intersectsBounds(image.bounds, sourceBounds)) continue;
         const resource = this.imageResources.get(image.path) || this.createImageResource(image.path);
         if (!resource.loaded) void this.loadImageTexture(image.path).catch(() => {});
-        const origin = this.sourceToWorld(page, [image.xMm, image.yMm]);
-        const size = this.sourceSizeToWorld(page, image.widthMm, image.heightMm);
+        const origin = image.worldOrigin || this.sourceToWorld(page, [image.xMm, image.yMm]);
+        const size = image.worldSize || this.sourceSizeToWorld(page, image.widthMm, image.heightMm);
         const values = this.imageUniformScratch;
         values[0] = origin[0];
         values[1] = origin[1];
@@ -716,14 +898,47 @@ export class SchematicWorldRenderer {
     }
   }
 
-  writeVisibleVectors(visiblePages) {
+  drawVisibleVectors(pass, visiblePages) {
     if (!this.isNativeScene) return 0;
     const values = this.vectorScratch;
     let offset = 0;
     let truncated = 0;
-    const canAppend = (floatCount) => offset + floatCount <= MAX_VECTOR_DRAW_FLOATS && offset + floatCount <= values.length;
-    pageLoop:
+    let submittedVertices = 0;
+    let submittedChunks = 0;
+    let pipelineSet = false;
+    const flush = () => {
+      if (!offset) return;
+      let buffer = this.vectorBuffers[submittedChunks];
+      if (!buffer) {
+        buffer = this.device.createBuffer({
+          size: MAX_VECTOR_FLOATS * 4,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        this.vectorBuffers.push(buffer);
+      }
+      this.device.queue.writeBuffer(buffer, 0, values, 0, offset);
+      if (!pipelineSet) {
+        pass.setPipeline(this.vectorPipeline);
+        pass.setBindGroup(0, this.edgeBindGroup);
+        pipelineSet = true;
+      }
+      const vertices = Math.floor(offset / 6);
+      pass.setVertexBuffer(0, buffer);
+      pass.draw(vertices);
+      submittedVertices += vertices;
+      submittedChunks += 1;
+      offset = 0;
+    };
+    const ensure = (floatCount) => {
+      if (floatCount > MAX_VECTOR_DRAW_FLOATS || floatCount > values.length) {
+        truncated += 1;
+        return false;
+      }
+      if (offset + floatCount > MAX_VECTOR_DRAW_FLOATS || offset + floatCount > values.length) flush();
+      return true;
+    };
     for (const page of visiblePages) {
+      if (this.domDetailPageIds.has(page.id)) continue;
       if (!this.pageHasNativeDetail(page)) continue;
       const chunk = this.vectorChunks.get(page.id);
       if (!chunk?.segments?.length && !chunk?.fills?.length) continue;
@@ -733,10 +948,7 @@ export class SchematicWorldRenderer {
       const candidates = querySpatialIndex(chunk.spatial, sourceBounds);
       for (const fill of candidates.fills) {
         if (!intersectsBounds(fill.bounds, sourceBounds)) continue;
-        if (!canAppend(18)) {
-          truncated += 1;
-          break pageLoop;
-        }
+        if (!ensure(18)) continue;
         const feature = this.featuresById.get(fill.featureId);
         const isSelectedNet = this.activeNetUid && feature?.netUid === this.activeNetUid;
         const isSelectedFeature = this.selectedFeatureId === fill.featureId;
@@ -747,7 +959,7 @@ export class SchematicWorldRenderer {
           : this.activeNetUid && isElectricalFeature(feature)
           ? mutedVectorColor(feature, fill.kind, fill.color)
           : vectorColor(feature, fill.kind, fill.color);
-        const points = fill.points.map((point) => this.sourceToWorld(page, point));
+        const points = fill.worldPoints || fill.points.map((point) => this.sourceToWorld(page, point));
         offset = writeFilledTriangle(values, offset, points[0], points[1], points[2], color);
       }
       for (const segment of candidates.segments) {
@@ -764,26 +976,45 @@ export class SchematicWorldRenderer {
           : vectorColor(feature, segment.kind, segment.color);
         const width = this.segmentWorldWidth(page, segment, feature, isSelectedNet || isSelectedFeature);
         for (const visibleSegment of this.visibleSegmentParts(page, segment, feature)) {
-          if (!canAppend(36)) {
-            truncated += 1;
-            break pageLoop;
-          }
-          const a = this.sourceToWorld(page, visibleSegment.a);
-          const b = this.sourceToWorld(page, visibleSegment.b);
+          if (!ensure(36)) continue;
+          const a = visibleSegment.worldA || this.sourceToWorld(page, visibleSegment.a);
+          const b = visibleSegment.worldB || this.sourceToWorld(page, visibleSegment.b);
           offset = writeStrokeQuad(values, offset, a, b, width, color);
         }
       }
     }
+    flush();
     this.truncatedVectorCount = truncated;
     this.vectorTruncated = truncated > 0;
-    if (!offset) return 0;
-    this.device.queue.writeBuffer(this.vectorBuffer, 0, values, 0, offset);
-    return Math.floor(offset / 6);
+    this.lastVectorVertices = submittedVertices;
+    this.lastVectorChunks = submittedChunks;
+    return submittedVertices;
   }
 
   pageHasNativeDetail(page) {
     if (!this.isNativeScene) return false;
     return page?.nativeDetail?.enabled !== false;
+  }
+
+  scheduleVisibleVectorLoads(visiblePages) {
+    if (!this.isNativeScene) return;
+    const inFlight = [...this.vectorChunks.values()].filter((chunk) => chunk?.promise && !chunk.loaded).length;
+    let slots = Math.max(0, MAX_CONCURRENT_VECTOR_LOADS - inFlight);
+    if (!slots) return;
+    const candidates = visiblePages
+      .filter((page) => !this.domDetailPageIds.has(page.id))
+      .filter((page) => this.pageHasNativeDetail(page) && this.pageSourcePixelsPerMm(page) >= this.pageNativeDetailThresholds(page).prefetch)
+      .filter((page) => !this.vectorChunks.get(page.id)?.loaded && !this.vectorChunks.get(page.id)?.promise)
+      .sort((a, b) => {
+        const aDistance = Math.hypot((a.worldX + a.widthMm / 2) - this.center[0], (a.worldY + a.heightMm / 2) - this.center[1]);
+        const bDistance = Math.hypot((b.worldX + b.widthMm / 2) - this.center[0], (b.worldY + b.heightMm / 2) - this.center[1]);
+        return aDistance - bDistance;
+      });
+    for (const page of candidates) {
+      void this.loadPageVectors(page).catch(() => {});
+      slots -= 1;
+      if (!slots) break;
+    }
   }
 
   featurePrimitiveBounds(page, featureId) {
@@ -829,9 +1060,13 @@ export class SchematicWorldRenderer {
   }
 
   visibleSegmentParts(page, segment, feature) {
+    if (segment._visibleParts) return segment._visibleParts;
     const kind = String(feature?.kind || "");
     const role = String(feature?.semanticRole || "");
-    if (kind !== "wire" && role !== "wire") return [segment];
+    if (kind !== "wire" && role !== "wire") {
+      segment._visibleParts = [segment];
+      return segment._visibleParts;
+    }
     let parts = [segment];
     for (const bounds of this.symbolClipBounds(page)) {
       const next = [];
@@ -839,7 +1074,159 @@ export class SchematicWorldRenderer {
       parts = next;
       if (!parts.length) break;
     }
-    return parts;
+    for (const part of parts) {
+      part.worldA = sourceToWorldPoint(page, part.a);
+      part.worldB = sourceToWorldPoint(page, part.b);
+    }
+    segment._visibleParts = parts;
+    return segment._visibleParts;
+  }
+
+  netTrackingSegments() {
+    if (!this.activeNetUid) return { netUid: "", anchorsByPage: new Map(), segments: [], intrasheetSegments: [] };
+    const selectedFeatureId = Number(this.selectedFeatureId || 0);
+    const selectedFeatureKey = String(this.selectedFeatureKey || "");
+    const selectedSourceId = String(this.selectedSourceId || "");
+    if (
+      this.netTrackingCache?.netUid === this.activeNetUid
+      && this.netTrackingCache?.selectedFeatureId === selectedFeatureId
+      && this.netTrackingCache?.selectedFeatureKey === selectedFeatureKey
+      && this.netTrackingCache?.selectedSourceId === selectedSourceId
+    ) {
+      return this.netTrackingCache;
+    }
+    this.selectedIntrasheetLinkIndex = -1;
+    const pageById = new Map(this.pages.map((page) => [page.id, page]));
+    const pageIds = this.manifest.netToPages?.[this.activeNetUid] || [];
+    const candidatePages = pageIds.length
+      ? pageIds.map((id) => pageById.get(id)).filter(Boolean)
+      : this.pages.filter((page) => page.netUids?.includes(this.activeNetUid));
+    const anchorsByPage = new Map();
+    for (const page of candidatePages.slice(0, MAX_NET_TRACKING_PAGES)) {
+      const anchors = this.netTrackingAnchorsForPage(page);
+      if (anchors.length) anchorsByPage.set(page.id, anchors);
+    }
+    const segments = [];
+    const intrasheetSegments = [];
+    for (const [pageId, anchors] of anchorsByPage) {
+      const pageSegments = nearestNeighborAnchorSegments(limitAnchorsForTracking(anchors), "intrasheet", pageId);
+      segments.push(...pageSegments);
+      intrasheetSegments.push(...pageSegments);
+    }
+    const pageAnchors = [...anchorsByPage.entries()]
+      .map(([pageId, anchors]) => representativeNetAnchor(pageById.get(pageId), anchors, {
+        featureId: selectedFeatureId,
+        stableKey: selectedFeatureKey,
+        sourceId: selectedSourceId,
+      }))
+      .filter(Boolean);
+    segments.push(...nearestNeighborAnchorSegments(pageAnchors, "intersheet", ""));
+    const indexedIntrasheetSegments = intrasheetSegments.map((segment, index) => ({ ...segment, intrasheetIndex: index }));
+    let intrasheetCursor = 0;
+    const indexedSegments = segments.map((segment, index) => {
+      if (segment.type !== "intrasheet") return { ...segment, id: index };
+      const intrasheetIndex = intrasheetCursor;
+      intrasheetCursor += 1;
+      return { ...segment, id: index, intrasheetIndex };
+    });
+    this.netTrackingCache = {
+      netUid: this.activeNetUid,
+      selectedFeatureId,
+      selectedFeatureKey,
+      selectedSourceId,
+      anchorsByPage,
+      segments: indexedSegments,
+      intrasheetSegments: indexedIntrasheetSegments,
+    };
+    if (this.selectedIntrasheetLinkIndex >= this.netTrackingCache.intrasheetSegments.length) {
+      this.selectedIntrasheetLinkIndex = -1;
+    }
+    return this.netTrackingCache;
+  }
+
+  netTrackingAnchorsForPage(page) {
+    const items = this.featuresByPage[page.id] || [];
+    const anchors = [];
+    for (const feature of items) {
+      if (feature.netUid !== this.activeNetUid || !feature.boundsMm) continue;
+      if (!isNetTrackingAnchor(feature)) continue;
+      const bounds = feature.boundsMm;
+      const centerSource = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2];
+      const center = this.sourceToWorld(page, centerSource);
+      anchors.push({
+        pageId: page.id,
+        featureId: Number(feature.id || 0),
+        stableKey: String(feature.stableKey || ""),
+        sourceId: String(feature.sourceId || feature.sourceUid || feature.objectId || ""),
+        kind: feature.kind || feature.semanticRole || "",
+        source: centerSource,
+        world: center,
+        bounds,
+        priority: netTrackingAnchorPriority(feature),
+      });
+    }
+    anchors.sort((a, b) => b.priority - a.priority || a.source[1] - b.source[1] || a.source[0] - b.source[0]);
+    return anchors;
+  }
+
+  writeNetTrackingOverlay() {
+    const tracking = this.netTrackingSegments();
+    this.lastNetFlowSegments = tracking.segments.length;
+    this.lastNetFlowIntrasheetSegments = tracking.intrasheetSegments.length;
+    if (!tracking.segments.length) {
+      this.lastNetFlowVertices = 0;
+      return 0;
+    }
+    const viewport = this.worldViewportBounds(this.scale * 96);
+    const values = this.netFlowScratch;
+    let offset = 0;
+    let distanceSeed = 0;
+    for (const segment of tracking.segments) {
+      if (!intersectsBounds(segmentWorldBounds(segment), viewport)) continue;
+      const isSelectedIntrasheet = segment.type === "intrasheet"
+        && segment.intrasheetIndex === this.selectedIntrasheetLinkIndex;
+      const widthPx = isSelectedIntrasheet ? 9.5 : segment.type === "intersheet" ? 8.0 : 4.8;
+      const kind = isSelectedIntrasheet ? 2 : segment.type === "intersheet" ? 1 : 0;
+      const written = writeFlowQuad(
+        values,
+        offset,
+        segment.a,
+        segment.b,
+        widthPx * this.scale,
+        kind,
+        distanceSeed,
+        this.scale,
+      );
+      if (written === offset) continue;
+      offset = written;
+      distanceSeed += Math.hypot(segment.b[0] - segment.a[0], segment.b[1] - segment.a[1]) / Math.max(this.scale, 1e-6);
+      if (offset + 24 > values.length) break;
+    }
+    if (!offset) {
+      this.lastNetFlowVertices = 0;
+      return 0;
+    }
+    this.device.queue.writeBuffer(this.netFlowBuffer, 0, values, 0, offset);
+    this.lastNetFlowVertices = offset / 4;
+    return offset / 4;
+  }
+
+  cycleNetIntrasheetLink(direction = 1) {
+    const tracking = this.netTrackingSegments();
+    if (!tracking.intrasheetSegments.length) return null;
+    const count = tracking.intrasheetSegments.length;
+    this.selectedIntrasheetLinkIndex = (this.selectedIntrasheetLinkIndex + direction + count) % count;
+    const segment = tracking.intrasheetSegments[this.selectedIntrasheetLinkIndex];
+    if (!segment) return null;
+    const bounds = segmentWorldBounds(segment, 14 * this.scale);
+    this.center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2];
+    this.scale = Math.max(
+      (bounds[2] - bounds[0]) / Math.max(1, this.canvas.width * 0.36),
+      (bounds[3] - bounds[1]) / Math.max(1, this.canvas.height * 0.30),
+      this.scale * 0.35,
+      0.025,
+    );
+    return { pageId: segment.pageId, segment };
   }
 
   writeNetHighlights(visiblePages) {
@@ -915,7 +1302,9 @@ export class SchematicWorldRenderer {
         if (!response.ok) throw new Error(`Failed to load schematic vector chunk ${page.id}: ${response.status}`);
         const payload = await response.json();
         const geometry = primitiveGeometry(payload.primitives || []);
-        const bytes = JSON.stringify(payload).length;
+        prepareWorldGeometry(page, geometry);
+        const jsonBytes = JSON.stringify(payload).length;
+        const bytes = jsonBytes;
         const chunk = {
           loaded: true,
           segments: geometry.segments,
@@ -956,6 +1345,32 @@ export class SchematicWorldRenderer {
       this.residentVectorBytes = Math.max(0, this.residentVectorBytes - (chunk.bytes || 0));
       if (this.residentVectorBytes <= MAX_RESIDENT_VECTOR_BYTES * 0.82) break;
     }
+  }
+
+  stats() {
+    const visible = this.visiblePages();
+    const visibleDensities = visible.map((page) => this.pageSourcePixelsPerMm(page));
+    const visibleThresholds = visible.map((page) => this.pageNativeDetailThresholds(page).enter);
+    return {
+      residentVectorBytes: this.residentVectorBytes,
+      vectorChunks: [...this.vectorChunks.values()].filter((chunk) => chunk?.loaded).length,
+      vectorLoads: [...this.vectorChunks.values()].filter((chunk) => chunk?.promise && !chunk.loaded).length,
+      failedVectorChunks: this.failedVectorChunks.size,
+      vectorVertices: this.lastVectorVertices || 0,
+      vectorDrawChunks: this.lastVectorChunks || 0,
+      truncatedVectors: this.truncatedVectorCount || 0,
+      nativeDetailPages: [...this.nativeDetailState.values()].filter(Boolean).length,
+      nativePxPerMm: Number((Math.max(0, ...visibleDensities) || 0).toFixed(2)),
+      nativeThresholdPxPerMm: Number((visibleThresholds.length ? Math.min(...visibleThresholds) : 0).toFixed(2)),
+      domDetailPages: this.domDetailPageIds.size,
+      netFlowSegments: this.lastNetFlowSegments || 0,
+      netFlowIntrasheetSegments: this.lastNetFlowIntrasheetSegments || 0,
+      netFlowVertices: this.lastNetFlowVertices || 0,
+    };
+  }
+
+  setDomDetailPageIds(ids) {
+    this.domDetailPageIds = new Set(ids || []);
   }
 
   async loadPageTexture(page, width) {
@@ -1169,14 +1584,14 @@ export class SchematicWorldRenderer {
         count = writePickTriangle(view, count, p0, p1, p2, image.featureId);
         count = writePickTriangle(view, count, p2, p1, p3, image.featureId);
       } else if (fill) {
-        const points = fill.points.map((point) => this.sourceToWorld(page, point));
+        const points = fill.worldPoints || fill.points.map((point) => this.sourceToWorld(page, point));
         count = writePickTriangle(view, count, points[0], points[1], points[2], fill.featureId);
       } else {
         const width = Math.max(this.segmentWorldWidth(page, segment, feature, false), this.scale * 7);
         for (const visibleSegment of this.visibleSegmentParts(page, segment, feature)) {
           if (count + 6 > MAX_PICK_VERTICES) break;
-          const a = this.sourceToWorld(page, visibleSegment.a);
-          const b = this.sourceToWorld(page, visibleSegment.b);
+          const a = visibleSegment.worldA || this.sourceToWorld(page, visibleSegment.a);
+          const b = visibleSegment.worldB || this.sourceToWorld(page, visibleSegment.b);
           count = writePickStrokeQuad(view, count, a, b, width, segment.featureId);
         }
       }
@@ -1425,6 +1840,34 @@ function primitiveGeometry(primitives) {
   return { segments, fills, images };
 }
 
+function prepareWorldGeometry(page, geometry) {
+  for (const segment of geometry.segments || []) {
+    segment.worldA = sourceToWorldPoint(page, segment.a);
+    segment.worldB = sourceToWorldPoint(page, segment.b);
+  }
+  for (const fill of geometry.fills || []) {
+    fill.worldPoints = fill.points.map((point) => sourceToWorldPoint(page, point));
+  }
+  for (const image of geometry.images || []) {
+    image.worldOrigin = sourceToWorldPoint(page, [image.xMm, image.yMm]);
+    image.worldSize = sourceSizeToWorld(page, image.widthMm, image.heightMm);
+  }
+}
+
+function sourceToWorldPoint(page, point) {
+  return [
+    page.worldX + point[0] / page.sourceWidthMm * page.widthMm,
+    page.worldY + point[1] / page.sourceHeightMm * page.heightMm,
+  ];
+}
+
+function sourceSizeToWorld(page, widthMm, heightMm) {
+  return [
+    widthMm / page.sourceWidthMm * page.widthMm,
+    heightMm / page.sourceHeightMm * page.heightMm,
+  ];
+}
+
 function appendRectFill(fills, featureId, kind, bounds, color) {
   const [left, top, right, bottom] = bounds;
   fills.push(
@@ -1618,6 +2061,111 @@ function isElectricalFeature(feature) {
   return Boolean(feature?.netUid);
 }
 
+function isNetTrackingAnchor(feature) {
+  const kind = String(feature?.kind || "");
+  const role = String(feature?.semanticRole || "");
+  if (kind === "pin" || kind === "pin_body") return true;
+  if (kind === "label" || kind === "global_label" || kind === "hierarchical_label") return true;
+  if (kind === "netclass_flag" || kind === "power_symbol" || kind === "power_port") return true;
+  if (role === "label" || role === "global_label" || role === "hierarchical_label") return true;
+  return false;
+}
+
+function netTrackingAnchorPriority(feature) {
+  const kind = String(feature?.kind || "");
+  const role = String(feature?.semanticRole || "");
+  if (kind === "global_label" || role === "global_label") return 130;
+  if (kind === "hierarchical_label" || role === "hierarchical_label") return 125;
+  if (kind === "label" || role === "label") return 118;
+  if (kind === "pin" || kind === "pin_body") return 106;
+  if (kind === "power_symbol" || kind === "power_port" || kind === "netclass_flag") return 98;
+  return 50;
+}
+
+function limitAnchorsForTracking(anchors) {
+  if (anchors.length <= MAX_NET_TRACKING_ANCHORS_PER_PAGE) return anchors;
+  const limited = anchors.slice(0, MAX_NET_TRACKING_ANCHORS_PER_PAGE);
+  limited.sort((a, b) => a.source[1] - b.source[1] || a.source[0] - b.source[0]);
+  return limited;
+}
+
+function representativeNetAnchor(page, anchors, selected = {}) {
+  if (!page || !anchors?.length) return null;
+  const selectedAnchor = selected.featureId || selected.stableKey || selected.sourceId
+    ? anchors.find((anchor) =>
+      (selected.featureId && Number(anchor.featureId || 0) === Number(selected.featureId))
+      || (selected.stableKey && anchor.stableKey === selected.stableKey)
+      || (selected.sourceId && anchor.sourceId === selected.sourceId))
+    : null;
+  if (selectedAnchor) {
+    return {
+      ...selectedAnchor,
+      kind: "selected-net-occurrence",
+      priority: 200,
+    };
+  }
+  const preferred = anchors
+    .filter((anchor) => anchor.priority >= 118)
+    .slice(0, 16);
+  const candidates = preferred.length ? preferred : anchors.slice(0, 16);
+  let x = 0;
+  let y = 0;
+  for (const anchor of candidates) {
+    x += anchor.world[0];
+    y += anchor.world[1];
+  }
+  const point = [x / candidates.length, y / candidates.length];
+  return {
+    pageId: page.id,
+    featureId: candidates[0]?.featureId || 0,
+    kind: "page-net-occurrence",
+    source: [0, 0],
+    world: point,
+    bounds: [point[0], point[1], point[0], point[1]],
+    priority: 1,
+  };
+}
+
+function nearestNeighborAnchorSegments(anchors, type, pageId) {
+  if (!anchors || anchors.length < 2) return [];
+  const remaining = anchors
+    .map((anchor) => ({ ...anchor }))
+    .sort((a, b) => a.world[1] - b.world[1] || a.world[0] - b.world[0]);
+  const segments = [];
+  let current = remaining.shift();
+  while (remaining.length) {
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+    for (let index = 0; index < remaining.length; index += 1) {
+      const candidate = remaining[index];
+      const distance = Math.hypot(candidate.world[0] - current.world[0], candidate.world[1] - current.world[1]);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    }
+    const next = remaining.splice(bestIndex, 1)[0];
+    segments.push({
+      type,
+      pageId: pageId || current.pageId || next.pageId || "",
+      a: current.world,
+      b: next.world,
+      sourceFeatureIds: [current.featureId, next.featureId].filter(Boolean),
+    });
+    current = next;
+  }
+  return segments;
+}
+
+function segmentWorldBounds(segment, pad = 0) {
+  return [
+    Math.min(segment.a[0], segment.b[0]) - pad,
+    Math.min(segment.a[1], segment.b[1]) - pad,
+    Math.max(segment.a[0], segment.b[0]) + pad,
+    Math.max(segment.a[1], segment.b[1]) + pad,
+  ];
+}
+
 function featurePickPriority(feature) {
   const kind = String(feature?.kind || "");
   const semantic = String(feature?.semanticRole || "");
@@ -1725,6 +2273,38 @@ function writeFilledTriangle(values, offset, a, b, c, color) {
   offset = writeVectorVertex(values, offset, a, color);
   offset = writeVectorVertex(values, offset, b, color);
   offset = writeVectorVertex(values, offset, c, color);
+  return offset;
+}
+
+function writeFlowVertex(values, offset, point, distancePx, kind) {
+  values[offset++] = point[0];
+  values[offset++] = point[1];
+  values[offset++] = distancePx;
+  values[offset++] = kind;
+  return offset;
+}
+
+function writeFlowQuad(values, offset, a, b, width, kind, distanceStartPx, scale) {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const length = Math.hypot(dx, dy);
+  if (length < 1e-6 || offset + 24 > values.length) return offset;
+  const half = width * 0.5;
+  const tx = dx / length;
+  const ty = dy / length;
+  const nx = -ty * half;
+  const ny = tx * half;
+  const p0 = [a[0] + nx, a[1] + ny];
+  const p1 = [a[0] - nx, a[1] - ny];
+  const p2 = [b[0] + nx, b[1] + ny];
+  const p3 = [b[0] - nx, b[1] - ny];
+  const distanceEndPx = distanceStartPx + length / Math.max(scale, 1e-6);
+  offset = writeFlowVertex(values, offset, p0, distanceStartPx, kind);
+  offset = writeFlowVertex(values, offset, p1, distanceStartPx, kind);
+  offset = writeFlowVertex(values, offset, p2, distanceEndPx, kind);
+  offset = writeFlowVertex(values, offset, p2, distanceEndPx, kind);
+  offset = writeFlowVertex(values, offset, p1, distanceStartPx, kind);
+  offset = writeFlowVertex(values, offset, p3, distanceEndPx, kind);
   return offset;
 }
 
