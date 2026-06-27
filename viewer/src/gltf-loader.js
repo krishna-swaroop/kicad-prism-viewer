@@ -36,11 +36,18 @@ export async function loadGltf(url, options = {}) {
         const normal = new Float32Array(count * 3);
         const netId = new Uint32Array(count);
         const objectFeatureId = new Uint32Array(count);
+        const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
         const value = [];
         const featureId = componentFeatures.get(designator)?.featureId || options.defaultFeatureId || 0;
         for (let index = 0; index < count; index += 1) {
           positionAccessor.getElement(index, value);
           transformPoint(position, index * 3, value, matrix);
+          bounds[0] = Math.min(bounds[0], position[index * 3]);
+          bounds[1] = Math.min(bounds[1], position[index * 3 + 1]);
+          bounds[2] = Math.min(bounds[2], position[index * 3 + 2]);
+          bounds[3] = Math.max(bounds[3], position[index * 3]);
+          bounds[4] = Math.max(bounds[4], position[index * 3 + 1]);
+          bounds[5] = Math.max(bounds[5], position[index * 3 + 2]);
           if (normalAccessor) {
             normalAccessor.getElement(index, value);
             transformNormal(normal, index * 3, value, matrix);
@@ -61,6 +68,8 @@ export async function loadGltf(url, options = {}) {
           indices,
           designator,
           nodeName: node.getName(),
+          meshName: mesh.getName(),
+          bounds,
           material: material
             ? {
                 name: material.getName(),

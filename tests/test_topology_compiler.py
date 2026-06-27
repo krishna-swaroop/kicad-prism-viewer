@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 
 from pipeline.topology_compiler import compile_topology
-from pipeline.topology_compiler.kicad_cli_export import _component_nodes
+from pipeline.topology_compiler.kicad_cli_export import (
+    BOARD_CONTEXT_CACHE_VERSION,
+    _board_context_export_args,
+    _component_nodes,
+)
 from pipeline.topology_compiler.semantic_gltf import SemanticGltfBuilder
 
 
@@ -69,6 +73,14 @@ class TopologyCompilerTests(unittest.TestCase):
             path.write_bytes(glb)
             components = _component_nodes(path)
         self.assertEqual(components, [{"designator": "U1", "node_index": 1, "mesh_names": ["Body"]}])
+
+    def test_board_context_export_excludes_duplicate_pad_geometry(self) -> None:
+        args = _board_context_export_args(Path("geometry"), Path("unit.kicad_pcb"))
+        self.assertIn("--include-soldermask", args)
+        self.assertIn("--include-silkscreen", args)
+        self.assertIn("--no-components", args)
+        self.assertNotIn("--include-pads", args)
+        self.assertIn("no-pads", BOARD_CONTEXT_CACHE_VERSION)
 
     def test_via_caps_and_barrel_share_one_source_feature(self) -> None:
         builder = SemanticGltfBuilder(self.semantic_topology())

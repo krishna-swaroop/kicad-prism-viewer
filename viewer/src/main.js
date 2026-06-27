@@ -5,6 +5,13 @@ import { Renderer } from "./renderer.js";
 import { SchematicWorldRenderer } from "./schematic-world-renderer.js";
 import { SvgDomSchematicRenderer } from "./svg-dom-schematic-renderer.js";
 
+const COPPER_TILE_GPU_BUDGET_BYTES = 72 * 1024 * 1024;
+const COPPER_TILE_PREFETCH_MARGIN = 0.35;
+const TILE_SCHEDULER_INTERVAL_MS = 120;
+const MAX_TILE_LOADS_PER_TICK = 12;
+const TILE_VERTEX_STRIDE_BYTES = 40;
+const TILE_INDEX_BYTES = 4;
+
 const topology = window.__TOPOLOGY__ || {};
 const semanticGeometry = window.__SEMANTIC_GEOMETRY__ || {};
 const appEl = document.getElementById("app");
@@ -48,6 +55,19 @@ const state = {
   pointerStartY: 0,
   loadedBytes: 0,
   triangles: 0,
+  residentTileBytes: 0,
+  residentTileGpuBytes: 0,
+  residentTileTriangles: 0,
+  tileLoads: 0,
+  tileEvictions: 0,
+  tileSchedulerMs: 0,
+  lastTileScheduleAt: 0,
+  visibleTileIds: new Set(),
+  frameCpuMs: 0,
+  frameCpuP95Ms: 0,
+  frameIntervalMs: 0,
+  frameIntervalP95Ms: 0,
+  frameSamples: [],
   fps: 0,
   frames: 0,
   fpsAt: performance.now(),
@@ -72,6 +92,7 @@ const scene = {
   loaded: new Set(),
   loading: new Map(),
   failed: new Map(),
+  residentTiles: new Map(),
   componentFeatures: new Map(),
   layerZOffsets: new Float32Array(256),
   layerZOffsetSignature: "",
@@ -149,7 +170,7 @@ async function boot() {
   renderer = await Renderer.create(canvas);
   camera = new CameraController(runtimeBoundsFromGltf(scene.manifest.bbox));
   renderer.setBarrels(scene.manifest.barrels || []);
-  await Promise.all([first ? loadLayer(Number(first.id)) : Promise.resolve(), loadBoard()]);
+  await loadBoard();
   await loadSchematicWorld();
   renderControls();
   bindInteractions();
@@ -158,7 +179,7 @@ async function boot() {
   bindPanelTabs();
   statusEl.textContent = "WebGPU semantic glTF active";
   void loadComponents();
-  void Promise.all(scene.copperLayers.slice(1).map((layer) => loadLayer(Number(layer.id))));
+  scheduleTileResidency(performance.now(), { force: true });
   requestAnimationFrame(frame);
 }
 
@@ -224,32 +245,53 @@ async function fetchJson(url) {
 }
 
 async function loadLayer(layerId) {
-  await Promise.all(
-    [...scene.tiles.values()]
-      .filter((tile) => Number(tile.layerId) === layerId)
-      .map((tile) => loadTile(tile)),
-  );
+  await Promise.all(tilesForLayer(layerId).map((tile) => loadTile(tile)));
 }
 
 async function loadTile(tile) {
-  if (scene.loaded.has(tile.id)) return;
+  const resident = scene.residentTiles.get(tile.id);
+  if (resident) {
+    resident.lastUsed = performance.now();
+    return;
+  }
   if (scene.loading.has(tile.id)) return scene.loading.get(tile.id);
   const promise = (async () => {
     try {
       const loaded = await loadGltf(new URL(tile.path, scene.manifestUrl).toString());
       state.loadedBytes += loaded.byteLength;
       const layer = scene.layers.find((item) => Number(item.id) === Number(tile.layerId));
+      const entries = [];
+      let triangles = 0;
+      let gpuBytes = 0;
       for (const primitive of loaded.primitives) {
-        renderer.addPrimitive(primitive, {
+        const entry = renderer.addPrimitive(primitive, {
           kind: "copper",
+          tileId: tile.id,
           layerId: Number(tile.layerId),
           color: layerColor(layer),
           baseZ: Number(layer?.z_mm || 0) / 1000,
           material: { baseColor: [1, 1, 1, 1], metallic: 0.78, roughness: 0.32 },
         });
-        state.triangles += primitive.indices.length / 3;
+        entries.push(entry);
+        triangles += primitive.indices.length / 3;
+        gpuBytes += estimatePrimitiveGpuBytes(primitive);
       }
+      const record = {
+        tile,
+        entries,
+        byteLength: loaded.byteLength,
+        gpuBytes,
+        triangles,
+        lastUsed: performance.now(),
+        pinned: false,
+      };
+      scene.residentTiles.set(tile.id, record);
       scene.loaded.add(tile.id);
+      state.tileLoads += 1;
+      state.residentTileBytes += loaded.byteLength;
+      state.residentTileGpuBytes += gpuBytes;
+      state.residentTileTriangles += triangles;
+      state.triangles = state.residentTileTriangles;
       scene.failed.delete(tile.id);
     } catch (error) {
       const previous = scene.failed.get(tile.id) || { count: 0, message: "" };
@@ -264,12 +306,174 @@ async function loadTile(tile) {
   return promise;
 }
 
+function tilesForLayer(layerId) {
+  return [...scene.tiles.values()].filter((tile) => Number(tile.layerId) === Number(layerId));
+}
+
+function estimatePrimitiveGpuBytes(primitive) {
+  return (primitive.position.length / 3) * TILE_VERTEX_STRIDE_BYTES + primitive.indices.length * TILE_INDEX_BYTES;
+}
+
+function evictTile(tileId) {
+  const record = scene.residentTiles.get(tileId);
+  if (!record) return;
+  renderer.removeEntries(record.entries);
+  scene.residentTiles.delete(tileId);
+  scene.loaded.delete(tileId);
+  state.residentTileBytes = Math.max(0, state.residentTileBytes - record.byteLength);
+  state.residentTileGpuBytes = Math.max(0, state.residentTileGpuBytes - record.gpuBytes);
+  state.residentTileTriangles = Math.max(0, state.residentTileTriangles - record.triangles);
+  state.triangles = state.residentTileTriangles;
+  state.tileEvictions += 1;
+}
+
+function scheduleTileResidency(now = performance.now(), options = {}) {
+  if (!renderer || !camera || state.workspace !== "pcb") return;
+  if (!options.force && now - state.lastTileScheduleAt < TILE_SCHEDULER_INTERVAL_MS) return;
+  const started = performance.now();
+  state.lastTileScheduleAt = now;
+  const needed = neededTileIdsForView();
+  state.visibleTileIds = needed;
+  const activeLoads = scene.loading.size;
+  const loadBudget = Math.max(0, MAX_TILE_LOADS_PER_TICK - activeLoads);
+  const missing = [...needed]
+    .map((tileId) => scene.tiles.get(tileId))
+    .filter((tile) => tile && !scene.residentTiles.has(tile.id) && !scene.loading.has(tile.id))
+    .sort((a, b) => tileDistanceToFocus(a) - tileDistanceToFocus(b))
+    .slice(0, loadBudget);
+  for (const tile of missing) void loadTile(tile);
+  for (const tileId of needed) {
+    const record = scene.residentTiles.get(tileId);
+    if (record) record.lastUsed = now;
+  }
+  evictUnneededTiles(needed);
+  state.tileSchedulerMs = performance.now() - started;
+}
+
+function neededTileIdsForView() {
+  const needed = new Set();
+  const visibleLayers = state.mode === "3d" ? state.visible3dLayers : state.compareLayers;
+  if (!visibleLayers.size || !panel) return needed;
+
+  if (state.mode === "layer") {
+    for (const tile of scene.tiles.values()) {
+      if (visibleLayers.has(Number(tile.layerId))) needed.add(tile.id);
+    }
+    return needed;
+  }
+
+  const activeNetTiles = new Set();
+  if (state.activeNetId) {
+    for (const tile of scene.tiles.values()) {
+      if (visibleLayers.has(Number(tile.layerId)) && tileHasNet(tile, state.activeNetId)) {
+        activeNetTiles.add(tile.id);
+      }
+    }
+  }
+  for (const tile of scene.tiles.values()) {
+    if (!visibleLayers.has(Number(tile.layerId))) continue;
+    const offset = state.mode === "layer" ? compareOffsets.get(Number(tile.layerId)) : null;
+    if (tileIntersectsView(tile, panel.matrix, offset, COPPER_TILE_PREFETCH_MARGIN)) needed.add(tile.id);
+  }
+  for (const tileId of activeNetTiles) needed.add(tileId);
+  return needed;
+}
+
+function evictUnneededTiles(needed) {
+  const budget = COPPER_TILE_GPU_BUDGET_BYTES;
+  if (state.residentTileGpuBytes <= budget) return;
+  const candidates = [...scene.residentTiles.values()]
+    .filter((record) => !needed.has(record.tile.id) && !scene.loading.has(record.tile.id))
+    .sort((a, b) => a.lastUsed - b.lastUsed);
+  for (const record of candidates) {
+    if (state.residentTileGpuBytes <= budget) break;
+    evictTile(record.tile.id);
+  }
+}
+
+function tileIntersectsView(tile, matrix, offset = null, marginScale = 0) {
+  const bounds = tileRuntimeBounds(tile);
+  if (!bounds) return true;
+  const margin = Math.max(bounds[3] - bounds[0], bounds[4] - bounds[1]) * marginScale;
+  const expanded = [
+    bounds[0] - margin + (offset?.[0] || 0),
+    bounds[1] - margin + (offset?.[1] || 0),
+    bounds[2] - 0.002,
+    bounds[3] + margin + (offset?.[0] || 0),
+    bounds[4] + margin + (offset?.[1] || 0),
+    bounds[5] + 0.002,
+  ];
+  return boundsIntersectsClip(expanded, matrix);
+}
+
+function tileRuntimeBounds(tile) {
+  const bounds = tile.boundsMm;
+  if (!bounds || bounds.length !== 4) return null;
+  const layer = scene.layers.find((item) => Number(item.id) === Number(tile.layerId));
+  const z = Number(layer?.z_mm || 0) / 1000;
+  return [
+    bounds[0] / 1000,
+    -bounds[3] / 1000,
+    z - 0.0004,
+    bounds[2] / 1000,
+    -bounds[1] / 1000,
+    z + 0.0004,
+  ];
+}
+
+function boundsIntersectsClip(bounds, matrix) {
+  const corners = [
+    [bounds[0], bounds[1], bounds[2]],
+    [bounds[3], bounds[1], bounds[2]],
+    [bounds[0], bounds[4], bounds[2]],
+    [bounds[3], bounds[4], bounds[2]],
+    [bounds[0], bounds[1], bounds[5]],
+    [bounds[3], bounds[1], bounds[5]],
+    [bounds[0], bounds[4], bounds[5]],
+    [bounds[3], bounds[4], bounds[5]],
+  ].map((point) => clipPoint(matrix, point));
+  const planes = [
+    (point) => point[0] < -point[3],
+    (point) => point[0] > point[3],
+    (point) => point[1] < -point[3],
+    (point) => point[1] > point[3],
+    (point) => point[2] < 0,
+    (point) => point[2] > point[3],
+  ];
+  return !planes.some((outside) => corners.every(outside));
+}
+
+function clipPoint(matrix, point) {
+  const x = point[0];
+  const y = point[1];
+  const z = point[2];
+  return [
+    matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12],
+    matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13],
+    matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14],
+    matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15],
+  ];
+}
+
+function tileHasNet(tile, netId) {
+  return Array.isArray(tile.netIds) && tile.netIds.some((value) => Number(value) === Number(netId));
+}
+
+function tileDistanceToFocus(tile) {
+  const bounds = tileRuntimeBounds(tile);
+  if (!bounds || !camera) return 0;
+  const x = (bounds[0] + bounds[3]) * 0.5 - camera.focus[0];
+  const y = (bounds[1] + bounds[4]) * 0.5 - camera.focus[1];
+  return x * x + y * y;
+}
+
 async function loadBoard() {
   const path = semanticGeometry.assets?.base_board_glb;
   if (!path) return;
   const loaded = await loadGltf(new URL(path, location.href).toString(), { defaultFeatureId: 0 });
   state.loadedBytes += loaded.byteLength;
-  for (const primitive of mergePrimitivesByMaterial(loaded.primitives, boardRole)) {
+  const contextPrimitives = loaded.primitives.filter((primitive) => boardRole(primitive) !== "pad");
+  for (const primitive of mergePrimitivesByMaterial(contextPrimitives, boardRole)) {
     renderer.addPrimitive(primitive, {
       kind: "board",
       boardRole: primitive.groupKey,
@@ -281,9 +485,10 @@ async function loadBoard() {
 }
 
 function boardRole(primitive) {
-  const name = String(primitive.nodeName || "").toLowerCase();
-  if (name.includes("_pad")) return "pad";
-  if (name.includes("_silkscreen")) return "silkscreen";
+  const name = `${primitive.nodeName || ""} ${primitive.meshName || ""} ${primitive.material?.name || ""}`.toLowerCase();
+  if (name.includes("_pad") || name.includes(".pad") || name.endsWith("pad")) return "pad";
+  if (name.includes("silkscreen")) return "silkscreen";
+  if (name.includes("soldermask")) return "soldermask";
   return "substrate";
 }
 
@@ -326,6 +531,7 @@ function mergePrimitivesByMaterial(primitives, classifier = () => "") {
     const indices = new Uint32Array(indexCount);
     let vertexOffset = 0;
     let indexOffset = 0;
+    const bounds = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
     for (const item of group) {
       const count = item.position.length / 3;
       position.set(item.position, vertexOffset * 3);
@@ -334,6 +540,14 @@ function mergePrimitivesByMaterial(primitives, classifier = () => "") {
       objectFeatureId.set(item.objectFeatureId, vertexOffset);
       for (let index = 0; index < item.indices.length; index += 1) {
         indices[indexOffset + index] = Number(item.indices[index]) + vertexOffset;
+      }
+      if (item.bounds) {
+        bounds[0] = Math.min(bounds[0], item.bounds[0]);
+        bounds[1] = Math.min(bounds[1], item.bounds[1]);
+        bounds[2] = Math.min(bounds[2], item.bounds[2]);
+        bounds[3] = Math.max(bounds[3], item.bounds[3]);
+        bounds[4] = Math.max(bounds[4], item.bounds[4]);
+        bounds[5] = Math.max(bounds[5], item.bounds[5]);
       }
       vertexOffset += count;
       indexOffset += item.indices.length;
@@ -346,6 +560,7 @@ function mergePrimitivesByMaterial(primitives, classifier = () => "") {
       indices,
       material: group[0].material,
       groupKey: classifier(group[0]),
+      bounds: Number.isFinite(bounds[0]) ? bounds : null,
     };
   });
 }
@@ -414,13 +629,17 @@ function hex(value) {
 }
 
 function frame(now) {
+  const frameStarted = performance.now();
+  const frameInterval = Math.max(0, now - lastFrame);
   if (state.workspace === "schematic" && schematicRenderer) {
+    lastFrame = now;
     const visible = schematicRenderer.visiblePages();
     const domPages = schematicDomRenderer ? schematicDomDetailPages(visible) : [];
     schematicRenderer.setDomDetailPageIds(domPages.map((page) => page.id));
     schematicScene.visiblePages = schematicRenderer.render();
     schematicDomRenderer?.syncWorldPages(domPages, schematicRenderer, { activeNetUid: schematicScene.activeNetUid });
     updateSchematicLabels();
+    recordFrameSample(frameInterval, performance.now() - frameStarted);
     updateDiagnostics(now);
     requestAnimationFrame(frame);
     return;
@@ -437,6 +656,7 @@ function frame(now) {
     viewport: { x: 0, y: 0, width: canvas.width, height: canvas.height },
     matrix: camera.matrix(canvas.width, canvas.height, state.mode === "layer"),
   };
+  scheduleTileResidency(now);
   renderer.render({
     panels: [panel],
     activeNetId: state.activeNetId,
@@ -451,9 +671,11 @@ function frame(now) {
     isolateNet: state.isolateNet,
     compareMode: state.mode === "layer",
     compareOffsets,
+    visibleTileIds: state.mode === "3d" ? state.visibleTileIds : null,
   });
   drawGizmo();
   updateLayerLabels();
+  recordFrameSample(frameInterval, performance.now() - frameStarted);
   updateDiagnostics(now);
   requestAnimationFrame(frame);
 }
@@ -883,11 +1105,11 @@ function refreshControls() {
       <span class="swatch" style="background:${rgbCss(layerColor(layer))}"></span>
       <span>${layer.name}</span><small>${index + 1}</small>
     </label>`).join("");
-  list.querySelectorAll("[data-layer]").forEach((input) => input.addEventListener("change", async () => {
+  list.querySelectorAll("[data-layer]").forEach((input) => input.addEventListener("change", () => {
     const layerId = Number(input.dataset.layer);
     const target = state.mode === "3d" ? state.visible3dLayers : state.compareLayers;
     input.checked ? target.add(layerId) : target.delete(layerId);
-    if (input.checked) await loadLayer(layerId);
+    scheduleTileResidency(performance.now(), { force: true });
   }));
 }
 
@@ -895,9 +1117,14 @@ function bindControlEvents() {
   layersEl.querySelectorAll("[data-mode]").forEach((button) => button.addEventListener("click", () => {
     state.mode = button.dataset.mode;
     if (state.mode === "layer") camera.setAxis("z", false);
+    else {
+      camera.frame(runtimeBoundsFromGltf(scene.manifest.bbox));
+      state.visibleTileIds = new Set();
+    }
     refreshControls();
+    scheduleTileResidency(performance.now(), { force: true });
   }));
-  layersEl.querySelectorAll("[data-preset]").forEach((button) => button.addEventListener("click", async () => {
+  layersEl.querySelectorAll("[data-preset]").forEach((button) => button.addEventListener("click", () => {
     const target = state.mode === "3d" ? state.visible3dLayers : state.compareLayers;
     target.clear();
     const preset = button.dataset.preset;
@@ -907,7 +1134,7 @@ function bindControlEvents() {
         || (preset === "inner" && index > 0 && index < scene.copperLayers.length - 1);
       if (include) target.add(Number(layer.id));
     }
-    await Promise.all([...target].map(loadLayer));
+    scheduleTileResidency(performance.now(), { force: true });
     refreshControls();
   }));
   viewControlsEl.querySelectorAll("[data-tool]").forEach((button) => button.addEventListener("click", () => {
@@ -949,7 +1176,7 @@ function bindPanelTabs() {
   }));
 }
 
-async function showNetLayers() {
+function showNetLayers() {
   const net = scene.nets.find((item) => Number(item.id) === state.activeNetId);
   if (!net) return;
   const names = new Set(net.metrics?.layers || []);
@@ -958,7 +1185,7 @@ async function showNetLayers() {
   for (const layer of scene.copperLayers) {
     if (names.has(layer.name)) target.add(Number(layer.id));
   }
-  await Promise.all([...target].map(loadLayer));
+  scheduleTileResidency(performance.now(), { force: true });
   refreshControls();
 }
 
@@ -996,6 +1223,7 @@ function selectNet(netId, shouldFrame) {
   selectionEl.textContent = JSON.stringify(net || {}, null, 2);
   updateSelectionCard();
   if (shouldFrame && net?.boundsMm) camera.frame(runtimeBounds(net.boundsMm));
+  scheduleTileResidency(performance.now(), { force: true });
 }
 
 function selectFeature(featureId, shouldFrame = false) {
@@ -1006,6 +1234,7 @@ function selectFeature(featureId, shouldFrame = false) {
   selectionEl.textContent = feature ? JSON.stringify(feature, null, 2) : "No object selected";
   updateSelectionCard();
   if (shouldFrame && feature?.bounds) camera.frame(feature.bounds);
+  scheduleTileResidency(performance.now(), { force: true });
 }
 
 function clearSelection() {
@@ -1344,6 +1573,7 @@ async function pickAt(event) {
     isolateNet: state.isolateNet,
     compareMode: state.mode === "layer",
     compareOffsets,
+    visibleTileIds: state.mode === "3d" ? state.visibleTileIds : null,
   });
   if (featureId) selectFeature(featureId, false);
   else clearSelection();
@@ -1580,10 +1810,26 @@ function darken(color, factor) {
       .toString(16).padStart(2, "0")).join("")}`;
 }
 
+function recordFrameSample(intervalMs, cpuMs) {
+  state.frameSamples.push({ intervalMs, cpuMs });
+  if (state.frameSamples.length > 180) state.frameSamples.shift();
+}
+
+function percentile(values, fraction) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * fraction))];
+}
+
 function updateDiagnostics(now) {
   state.frames += 1;
   if (now - state.fpsAt <= 500) return;
   state.fps = state.frames * 1000 / (now - state.fpsAt);
+  const samples = state.frameSamples;
+  state.frameIntervalMs = samples.length ? samples.reduce((sum, item) => sum + item.intervalMs, 0) / samples.length : 0;
+  state.frameCpuMs = samples.length ? samples.reduce((sum, item) => sum + item.cpuMs, 0) / samples.length : 0;
+  state.frameIntervalP95Ms = percentile(samples.map((item) => item.intervalMs), 0.95);
+  state.frameCpuP95Ms = percentile(samples.map((item) => item.cpuMs), 0.95);
   state.frames = 0;
   state.fpsAt = now;
   const schematicStats = state.workspace === "schematic" && schematicRenderer ? schematicRenderer.stats() : null;
@@ -1606,6 +1852,8 @@ function updateDiagnostics(now) {
       ["Mount", `${domStats.mountMs.toFixed(1)} ms`],
       ["Highlight", `${domStats.highlightMs.toFixed(1)} ms`],
       ["Fallback", domStats.fallbackReason || "-"],
+      ["Frame interval", `${state.frameIntervalMs.toFixed(2)} ms avg / ${state.frameIntervalP95Ms.toFixed(2)} p95`],
+      ["CPU frame", `${state.frameCpuMs.toFixed(2)} ms avg / ${state.frameCpuP95Ms.toFixed(2)} p95`],
       ["FPS", state.fps.toFixed(1)],
     ]
       : [
@@ -1628,6 +1876,8 @@ function updateDiagnostics(now) {
       ["Native detail", `${schematicStats.nativeDetailPages} pages @ ${schematicStats.nativePxPerMm} / ${schematicStats.nativeThresholdPxPerMm} px/mm`],
       ["Vector failures", schematicStats.failedVectorChunks],
       ["Truncated", schematicStats.truncatedVectors],
+      ["Frame interval", `${state.frameIntervalMs.toFixed(2)} ms avg / ${state.frameIntervalP95Ms.toFixed(2)} p95`],
+      ["CPU frame", `${state.frameCpuMs.toFixed(2)} ms avg / ${state.frameCpuP95Ms.toFixed(2)} p95`],
       ["FPS", state.fps.toFixed(1)],
     ]
     : [
@@ -1635,9 +1885,18 @@ function updateDiagnostics(now) {
     ["Mode", state.mode === "3d" ? "3D" : "Layer Compare"],
     ["Visible layers", state.mode === "3d" ? state.visible3dLayers.size : state.compareLayers.size],
     ["Resident tiles", scene.loaded.size],
+    ["Loading tiles", scene.loading.size],
+    ["Failed tiles", scene.failed.size],
     ["Triangles", Math.round(state.triangles).toLocaleString()],
     ["Downloaded", `${(state.loadedBytes / 1048576).toFixed(1)} MB`],
+    ["Resident GLB", `${(state.residentTileBytes / 1048576).toFixed(1)} MB`],
+    ["Resident GPU", `${(state.residentTileGpuBytes / 1048576).toFixed(1)} MB`],
+    ["Tile loads", state.tileLoads.toLocaleString()],
+    ["Tile evictions", state.tileEvictions.toLocaleString()],
+    ["Tile scheduler", `${state.tileSchedulerMs.toFixed(2)} ms`],
     ["Active net", scene.nets.find((net) => Number(net.id) === state.activeNetId)?.name || "-"],
+    ["Frame interval", `${state.frameIntervalMs.toFixed(2)} ms avg / ${state.frameIntervalP95Ms.toFixed(2)} p95`],
+    ["CPU frame", `${state.frameCpuMs.toFixed(2)} ms avg / ${state.frameCpuP95Ms.toFixed(2)} p95`],
     ["FPS", state.fps.toFixed(1)],
   ];
   diagnosticsEl.innerHTML = rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");

@@ -14,6 +14,7 @@ from typing import Any
 
 
 DEFAULT_KICAD_CLI = Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")
+BOARD_CONTEXT_CACHE_VERSION = "board-context-no-pads-a6"
 
 
 @dataclass
@@ -80,21 +81,9 @@ def export_project_geometry(
         _run_cached_export(
             "board_context",
             cli,
-            [
-                "pcb",
-                "export",
-                "glb",
-                "--force",
-                "--output",
-                str(geometry_dir / "base_board.glb"),
-                "--no-components",
-                "--include-pads",
-                "--include-silkscreen",
-                "--include-soldermask",
-                str(pcb_file),
-            ],
+            _board_context_export_args(geometry_dir, pcb_file),
             cache_dir=cache_dir,
-            cache_key=f"{pcb_hash}-{cli_version}-board-context-pads-a5",
+            cache_key=f"{pcb_hash}-{cli_version}-{BOARD_CONTEXT_CACHE_VERSION}",
         )
     )
     component_export = _run_cached_export(
@@ -154,6 +143,21 @@ def export_project_geometry(
     manifest_path = output_dir / "semantic_geometry.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
+
+
+def _board_context_export_args(geometry_dir: Path, pcb_file: Path) -> list[str]:
+    return [
+        "pcb",
+        "export",
+        "glb",
+        "--force",
+        "--output",
+        str(geometry_dir / "base_board.glb"),
+        "--no-components",
+        "--include-silkscreen",
+        "--include-soldermask",
+        str(pcb_file),
+    ]
 
 
 def _cli_version(cli: Path) -> str:

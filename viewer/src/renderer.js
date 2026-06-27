@@ -410,10 +410,31 @@ export class Renderer {
         { binding: 2, resource: { buffer: this.layerOffsetBuffer } },
       ],
     });
-    const entry = { ...metadata, id: this.nextEntryId++, vertexBuffer, indexBuffer, indexCount: indices.length, drawBuffer, bindGroup };
+    const entry = {
+      ...metadata,
+      bounds: primitive.bounds || metadata.bounds || null,
+      id: this.nextEntryId++,
+      vertexBuffer,
+      indexBuffer,
+      indexCount: indices.length,
+      drawBuffer,
+      bindGroup,
+    };
     this.entries.push(entry);
     this.bundleCache.clear();
     return entry;
+  }
+
+  removeEntries(entries) {
+    if (!entries?.length) return;
+    const removeIds = new Set(entries.map((entry) => entry.id));
+    for (const entry of entries) {
+      entry.vertexBuffer?.destroy?.();
+      entry.indexBuffer?.destroy?.();
+      entry.drawBuffer?.destroy?.();
+    }
+    this.entries = this.entries.filter((entry) => !removeIds.has(entry.id));
+    this.bundleCache.clear();
   }
 
   setBarrels(records) {
@@ -485,6 +506,7 @@ export class Renderer {
     isolateNet,
     compareMode = false,
     compareOffsets = new Map(),
+    visibleTileIds = null,
   }) {
     this.resize();
     this.device.queue.writeBuffer(this.layerOffsetBuffer, 0, layerOffsets);
@@ -505,7 +527,7 @@ export class Renderer {
       pass.setScissorRect(viewport.x, viewport.y, viewport.width, viewport.height);
       this.writeGlobals(panel.matrix, activeNetId, panel.layerId, time, selectedFeatureId);
       const visibleEntries = this.entries.filter((entry) =>
-        this.visible(entry, panel.layerId, visibleLayers, showBoard, showComponents, componentOpacity, compareMode));
+        this.visible(entry, panel.layerId, visibleLayers, showBoard, showComponents, componentOpacity, compareMode, visibleTileIds));
       for (const entry of visibleEntries) {
         this.writeDraw(
           entry,
@@ -542,7 +564,9 @@ export class Renderer {
     });
   }
 
-  visible(entry, panelLayer, visibleLayers, showBoard, showComponents, componentOpacity, compareMode = false) {
+  visible(entry, panelLayer, visibleLayers, showBoard, showComponents, componentOpacity, compareMode = false, visibleTileIds = null) {
+    if (entry.kind === "board" && entry.boardRole === "pad") return false;
+    if (!compareMode && entry.kind === "copper" && visibleTileIds && !visibleTileIds.has(entry.tileId)) return false;
     if (compareMode) return entry.kind === "copper" && visibleLayers.has(entry.layerId);
     if (entry.kind === "board") return panelLayer === 0 && showBoard;
     if (entry.kind === "component") return panelLayer === 0 && showComponents && componentOpacity > 0.001;
@@ -578,18 +602,21 @@ export class Renderer {
     const color = entry.kind === "copper" ? entry.color : entry.material.baseColor;
     data.set(color, 0);
     data.set([entry.material.metallic || 0, entry.material.roughness ?? 0.72, 0, 0], 4);
+    const boardOverlayOffset = boardContextOffset(entry);
     data.set([
       compareOffset?.[0] || 0,
       compareOffset?.[1] || 0,
-      compareMode ? -(entry.baseZ || 0) : entry.layerOffset || 0,
+      (compareMode ? -(entry.baseZ || 0) : entry.layerOffset || 0) + boardOverlayOffset,
       0,
     ], 8);
-    const opacity = entry.kind === "component" ? componentOpacity : entry.kind === "board" ? boardOpacity : 1;
+    const materialAlpha = Number.isFinite(color?.[3]) ? color[3] : 1;
+    const opacity = entry.kind === "component"
+      ? componentOpacity
+      : entry.kind === "board"
+        ? boardOpacity * boardRoleOpacity(entry, materialAlpha)
+        : 1;
     const kind = entry.kind === "copper" ? 1 : entry.kind === "component" ? 2 : 0;
-    const boardOpacityValue = entry.kind === "board" && entry.boardRole === "substrate"
-      ? boardOpacity
-      : opacity;
-    data.set([kind, boardOpacityValue, isolateNet ? 1 : 0, compareMode ? 1 : 0], 12);
+    data.set([kind, opacity, isolateNet ? 1 : 0, compareMode ? 1 : 0], 12);
     this.device.queue.writeBuffer(entry.drawBuffer, 0, data);
   }
 
@@ -659,6 +686,7 @@ export class Renderer {
         options.showComponents,
         options.componentOpacity,
         options.compareMode,
+        options.visibleTileIds,
       )) continue;
       if (entry.kind === "board") continue;
       this.writeDraw(
@@ -706,6 +734,24 @@ export class Renderer {
       readBuffer.destroy();
     }
   }
+}
+
+function boardRoleOpacity(entry, materialAlpha) {
+  if (entry.kind !== "board") return 1;
+  if (entry.boardRole === "substrate") return 1;
+  if (entry.boardRole === "soldermask") return Math.min(materialAlpha, 0.72);
+  if (entry.boardRole === "silkscreen") return Math.min(materialAlpha, 0.92);
+  return materialAlpha;
+}
+
+function boardContextOffset(entry) {
+  if (entry.kind !== "board") return 0;
+  if (entry.boardRole !== "soldermask" && entry.boardRole !== "silkscreen") return 0;
+  const bounds = entry.bounds;
+  const centerZ = bounds ? (bounds[2] + bounds[5]) * 0.5 : 0;
+  const direction = centerZ < 0 ? -1 : 1;
+  const roleOffset = entry.boardRole === "silkscreen" ? 0.000035 : 0.000018;
+  return direction * roleOffset;
 }
 
 function clampViewport(viewport, width, height) {
