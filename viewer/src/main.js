@@ -9,6 +9,8 @@ const COPPER_TILE_GPU_BUDGET_BYTES = 72 * 1024 * 1024;
 const COPPER_TILE_PREFETCH_MARGIN = 0.35;
 const TILE_SCHEDULER_INTERVAL_MS = 120;
 const MAX_TILE_LOADS_PER_TICK = 12;
+const INTERACTIVE_TILE_LOADS_PER_TICK = 48;
+const COMPARE_REVEAL_DURATION_MS = 230;
 const TILE_VERTEX_STRIDE_BYTES = 40;
 const TILE_INDEX_BYTES = 4;
 
@@ -39,6 +41,7 @@ const state = {
   mode: "3d",
   cameraTool: "orbit",
   compareLayers: new Set(),
+  desiredCompareLayers: new Set(),
   visible3dLayers: new Set(),
   activeNetId: 0,
   selectedFeatureId: 0,
@@ -104,6 +107,13 @@ const compareAnimation = {
   from: new Map(),
   current: new Map(),
 };
+const compareTransition = {
+  phase: "idle",
+  previous: new Set(),
+  target: new Set(),
+  previousOffsets: new Map(),
+  started: 0,
+};
 const schematicScene = {
   manifest: null,
   manifestUrl: "",
@@ -164,6 +174,7 @@ async function boot() {
   const first = scene.copperLayers[0];
   if (first) {
     state.compareLayers.add(Number(first.id));
+    state.desiredCompareLayers.add(Number(first.id));
     for (const layer of scene.copperLayers) state.visible3dLayers.add(Number(layer.id));
   }
 
@@ -329,13 +340,15 @@ function evictTile(tileId) {
 
 function scheduleTileResidency(now = performance.now(), options = {}) {
   if (!renderer || !camera || state.workspace !== "pcb") return;
-  if (!options.force && now - state.lastTileScheduleAt < TILE_SCHEDULER_INTERVAL_MS) return;
+  const interactiveComparePreload = state.mode === "layer" && compareTransition.phase === "preload";
+  if (!options.force && !interactiveComparePreload && now - state.lastTileScheduleAt < TILE_SCHEDULER_INTERVAL_MS) return;
   const started = performance.now();
   state.lastTileScheduleAt = now;
   const needed = neededTileIdsForView();
   state.visibleTileIds = needed;
   const activeLoads = scene.loading.size;
-  const loadBudget = Math.max(0, MAX_TILE_LOADS_PER_TICK - activeLoads);
+  const maxLoads = interactiveComparePreload ? INTERACTIVE_TILE_LOADS_PER_TICK : MAX_TILE_LOADS_PER_TICK;
+  const loadBudget = Math.max(0, maxLoads - activeLoads);
   const missing = [...needed]
     .map((tileId) => scene.tiles.get(tileId))
     .filter((tile) => tile && !scene.residentTiles.has(tile.id) && !scene.loading.has(tile.id))
@@ -352,7 +365,7 @@ function scheduleTileResidency(now = performance.now(), options = {}) {
 
 function neededTileIdsForView() {
   const needed = new Set();
-  const visibleLayers = state.mode === "3d" ? state.visible3dLayers : state.compareLayers;
+  const visibleLayers = state.mode === "3d" ? state.visible3dLayers : compareResidencyLayers();
   if (!visibleLayers.size || !panel) return needed;
 
   if (state.mode === "layer") {
@@ -377,6 +390,26 @@ function neededTileIdsForView() {
   }
   for (const tileId of activeNetTiles) needed.add(tileId);
   return needed;
+}
+
+function compareResidencyLayers() {
+  if (state.mode !== "layer") return state.compareLayers;
+  if (compareTransition.phase === "idle") return state.compareLayers;
+  return unionSets(compareTransition.previous, compareTransition.target);
+}
+
+function compareRenderLayers() {
+  if (state.mode !== "layer") return state.visible3dLayers;
+  if (compareTransition.phase === "reveal") return unionSets(compareTransition.previous, compareTransition.target);
+  return state.compareLayers;
+}
+
+function unionSets(...sets) {
+  const output = new Set();
+  for (const set of sets) {
+    for (const value of set || []) output.add(Number(value));
+  }
+  return output;
 }
 
 function evictUnneededTiles(needed) {
@@ -650,20 +683,23 @@ function frame(now) {
   renderer.resize();
   const layerZOffsets = stackupOffsets();
   for (const entry of renderer.entries) entry.layerOffset = layerZOffsets[entry.layerId] || 0;
+  updateCompareTransition(now);
   compareOffsets = updateCompareLayout(now);
+  const compareAlphas = compareLayerAlphas(now);
   panel = {
     layerId: 0,
     viewport: { x: 0, y: 0, width: canvas.width, height: canvas.height },
     matrix: camera.matrix(canvas.width, canvas.height, state.mode === "layer"),
   };
   scheduleTileResidency(now);
+  const visibleLayers = state.mode === "3d" ? state.visible3dLayers : compareRenderLayers();
   renderer.render({
     panels: [panel],
     activeNetId: state.activeNetId,
     selectedFeatureId: state.selectedFeatureId,
     time: now / 1000,
     layerOffsets: layerZOffsets,
-    visibleLayers: state.mode === "3d" ? state.visible3dLayers : state.compareLayers,
+    visibleLayers,
     showBoard: state.showBoard,
     showComponents: state.showComponents,
     componentOpacity: clamp(1 - state.separation / 0.1, 0, 1),
@@ -671,6 +707,7 @@ function frame(now) {
     isolateNet: state.isolateNet,
     compareMode: state.mode === "layer",
     compareOffsets,
+    layerAlphas: compareAlphas,
     visibleTileIds: state.mode === "3d" ? state.visibleTileIds : null,
   });
   drawGizmo();
@@ -782,12 +819,91 @@ function updateCompareLayout(now) {
     offsets.set(target.layerId, current);
     compareAnimation.current.set(target.layerId, current);
   }
+  if (compareTransition.phase === "reveal") {
+    for (const layerId of compareTransition.previous) {
+      if (!offsets.has(Number(layerId))) {
+        offsets.set(Number(layerId), compareTransition.previousOffsets.get(Number(layerId)) || [0, 0, 0]);
+      }
+    }
+  }
   for (const layerId of [...compareAnimation.current.keys()]) {
     if (!targets.some((item) => item.layerId === layerId)) {
       compareAnimation.current.delete(layerId);
     }
   }
   return offsets;
+}
+
+function beginCompareLayerTransition(targetLayers) {
+  const target = new Set([...targetLayers].map(Number));
+  if (setsEqual(target, state.desiredCompareLayers) && compareTransition.phase !== "idle") return;
+  state.desiredCompareLayers = target;
+  if (setsEqual(target, state.compareLayers)) {
+    compareTransition.phase = "idle";
+    compareTransition.previous.clear();
+    compareTransition.target.clear();
+    return;
+  }
+  compareTransition.phase = "preload";
+  compareTransition.previous = new Set(state.compareLayers);
+  compareTransition.target = new Set(target);
+  compareTransition.previousOffsets = new Map(compareAnimation.current);
+  compareTransition.started = performance.now();
+  scheduleTileResidency(compareTransition.started, { force: true });
+}
+
+function updateCompareTransition(now) {
+  if (state.mode !== "layer" || compareTransition.phase === "idle") return;
+  if (compareTransition.phase === "preload") {
+    if (!compareTargetTilesReady(compareTransition.target)) {
+      scheduleTileResidency(now, { force: true });
+      return;
+    }
+    compareTransition.phase = "reveal";
+    compareTransition.started = now;
+    compareTransition.previousOffsets = new Map(compareAnimation.current);
+    state.compareLayers = new Set(compareTransition.target);
+    compareAnimation.key = "";
+    return;
+  }
+  if (compareTransition.phase === "reveal" && now - compareTransition.started >= COMPARE_REVEAL_DURATION_MS) {
+    state.compareLayers = new Set(compareTransition.target);
+    compareTransition.phase = "idle";
+    compareTransition.previous.clear();
+    compareTransition.target.clear();
+    compareTransition.previousOffsets.clear();
+    scheduleTileResidency(now, { force: true });
+  }
+}
+
+function compareTargetTilesReady(targetLayers) {
+  for (const tile of scene.tiles.values()) {
+    if (!targetLayers.has(Number(tile.layerId))) continue;
+    if (!scene.residentTiles.has(tile.id) && !scene.failed.has(tile.id)) return false;
+  }
+  return true;
+}
+
+function compareLayerAlphas(now) {
+  if (state.mode !== "layer" || compareTransition.phase !== "reveal") return null;
+  const progress = clamp((now - compareTransition.started) / COMPARE_REVEAL_DURATION_MS, 0, 1);
+  const eased = progress * progress * (3 - 2 * progress);
+  const alphas = new Map();
+  for (const layerId of compareTransition.previous) {
+    alphas.set(Number(layerId), compareTransition.target.has(Number(layerId)) ? 1 : 1 - eased);
+  }
+  for (const layerId of compareTransition.target) {
+    alphas.set(Number(layerId), compareTransition.previous.has(Number(layerId)) ? 1 : eased);
+  }
+  return alphas;
+}
+
+function setsEqual(left, right) {
+  if (left.size !== right.size) return false;
+  for (const value of left) {
+    if (!right.has(value)) return false;
+  }
+  return true;
 }
 
 function renderControls() {
@@ -1098,7 +1214,7 @@ function refreshControls() {
   viewControlsEl.querySelector("#show-components").checked = state.showComponents;
   viewControlsEl.querySelector("#separation").value = state.separation;
   const list = layersEl.querySelector(".layer-list");
-  const selected = state.mode === "3d" ? state.visible3dLayers : state.compareLayers;
+  const selected = state.mode === "3d" ? state.visible3dLayers : state.desiredCompareLayers;
   list.innerHTML = scene.copperLayers.map((layer, index) => `
     <label class="layer-row">
       <input type="checkbox" data-layer="${layer.id}" ${selected.has(Number(layer.id)) ? "checked" : ""}>
@@ -1107,9 +1223,14 @@ function refreshControls() {
     </label>`).join("");
   list.querySelectorAll("[data-layer]").forEach((input) => input.addEventListener("change", () => {
     const layerId = Number(input.dataset.layer);
-    const target = state.mode === "3d" ? state.visible3dLayers : state.compareLayers;
-    input.checked ? target.add(layerId) : target.delete(layerId);
-    scheduleTileResidency(performance.now(), { force: true });
+    if (state.mode === "3d") {
+      input.checked ? state.visible3dLayers.add(layerId) : state.visible3dLayers.delete(layerId);
+      scheduleTileResidency(performance.now(), { force: true });
+    } else {
+      const target = new Set(state.desiredCompareLayers);
+      input.checked ? target.add(layerId) : target.delete(layerId);
+      beginCompareLayerTransition(target);
+    }
   }));
 }
 
@@ -1125,7 +1246,7 @@ function bindControlEvents() {
     scheduleTileResidency(performance.now(), { force: true });
   }));
   layersEl.querySelectorAll("[data-preset]").forEach((button) => button.addEventListener("click", () => {
-    const target = state.mode === "3d" ? state.visible3dLayers : state.compareLayers;
+    const target = state.mode === "3d" ? state.visible3dLayers : new Set();
     target.clear();
     const preset = button.dataset.preset;
     for (const [index, layer] of scene.copperLayers.entries()) {
@@ -1134,7 +1255,8 @@ function bindControlEvents() {
         || (preset === "inner" && index > 0 && index < scene.copperLayers.length - 1);
       if (include) target.add(Number(layer.id));
     }
-    scheduleTileResidency(performance.now(), { force: true });
+    if (state.mode === "3d") scheduleTileResidency(performance.now(), { force: true });
+    else beginCompareLayerTransition(target);
     refreshControls();
   }));
   viewControlsEl.querySelectorAll("[data-tool]").forEach((button) => button.addEventListener("click", () => {
@@ -1180,12 +1302,13 @@ function showNetLayers() {
   const net = scene.nets.find((item) => Number(item.id) === state.activeNetId);
   if (!net) return;
   const names = new Set(net.metrics?.layers || []);
-  const target = state.mode === "3d" ? state.visible3dLayers : state.compareLayers;
+  const target = state.mode === "3d" ? state.visible3dLayers : new Set();
   target.clear();
   for (const layer of scene.copperLayers) {
     if (names.has(layer.name)) target.add(Number(layer.id));
   }
-  scheduleTileResidency(performance.now(), { force: true });
+  if (state.mode === "3d") scheduleTileResidency(performance.now(), { force: true });
+  else beginCompareLayerTransition(target);
   refreshControls();
 }
 
@@ -1747,8 +1870,9 @@ function updateLayerLabels() {
     return;
   }
   const bounds = runtimeBoundsFromGltf(scene.manifest.bbox);
+  const visibleLayers = compareRenderLayers();
   labelsEl.innerHTML = scene.copperLayers
-    .filter((layer) => state.compareLayers.has(Number(layer.id)))
+    .filter((layer) => visibleLayers.has(Number(layer.id)))
     .map((layer) => {
       const offset = compareOffsets.get(Number(layer.id)) || [0, 0, 0];
       const screen = projectPoint(

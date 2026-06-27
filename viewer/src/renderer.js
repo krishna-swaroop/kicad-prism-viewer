@@ -506,6 +506,7 @@ export class Renderer {
     isolateNet,
     compareMode = false,
     compareOffsets = new Map(),
+    layerAlphas = null,
     visibleTileIds = null,
   }) {
     this.resize();
@@ -537,6 +538,7 @@ export class Renderer {
           isolateNet,
           compareMode,
           compareOffsets.get(entry.layerId),
+          layerAlphas?.get(entry.layerId) ?? 1,
         );
       }
       if (visibleEntries.length > 64) {
@@ -596,6 +598,7 @@ export class Renderer {
     isolateNet = false,
     compareMode = false,
     compareOffset = null,
+    layerAlpha = 1,
   ) {
     const data = this.drawScratch;
     data.fill(0);
@@ -614,7 +617,7 @@ export class Renderer {
       ? componentOpacity
       : entry.kind === "board"
         ? boardOpacity * boardRoleOpacity(entry, materialAlpha)
-        : 1;
+        : layerAlpha;
     const kind = entry.kind === "copper" ? 1 : entry.kind === "component" ? 2 : 0;
     data.set([kind, opacity, isolateNet ? 1 : 0, compareMode ? 1 : 0], 12);
     this.device.queue.writeBuffer(entry.drawBuffer, 0, data);
