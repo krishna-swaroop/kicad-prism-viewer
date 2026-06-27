@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "build:viewer": "esbuild viewer/src/main.js --bundle --minify --format=iife --platform=browser --external:node:fs --external:node:path --outfile=viewer/app.js",
+    "build:element": "esbuild viewer/src/element-entry.js --bundle --minify --format=esm --platform=browser --loader:.css=text --external:node:fs --external:node:path --outfile=dist/prism-semantic-viewer.js",
     "test:gltf": "node --test tools/semantic-gltf/*.test.mjs",
     "bench:schematic-dom": "node tools/schematic-dom-benchmark.mjs"
   },

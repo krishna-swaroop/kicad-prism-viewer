@@ -14,27 +14,54 @@ const COMPARE_REVEAL_DURATION_MS = 230;
 const TILE_VERTEX_STRIDE_BYTES = 40;
 const TILE_INDEX_BYTES = 4;
 
-const topology = window.__TOPOLOGY__ || {};
-const semanticGeometry = window.__SEMANTIC_GEOMETRY__ || {};
-const appEl = document.getElementById("app");
-const canvas = document.getElementById("viewport");
-const schematicCanvas = document.getElementById("schematic-viewport");
-const schematicDomLayer = document.getElementById("schematic-dom-layer");
-const schematicFlowOverlay = document.getElementById("schematic-flow-overlay");
-const statusEl = document.getElementById("status");
-const viewerKindEl = document.getElementById("viewer-kind");
-const selectionEl = document.getElementById("selection");
-const diagnosticsEl = document.getElementById("diagnostics");
-const layersEl = document.getElementById("layers");
-const searchControlsEl = document.getElementById("search-controls");
-const viewControlsEl = document.getElementById("view-controls");
-const fallbackEl = document.getElementById("fallback");
-const labelsEl = document.getElementById("panel-labels");
-const schematicLabelsEl = document.getElementById("schematic-labels");
-const gizmo = document.getElementById("axis-gizmo");
-const selectionCardEl = document.getElementById("selection-card");
-const primaryHeadingEl = document.getElementById("primary-heading");
-const primaryDescriptionEl = document.getElementById("primary-description");
+let topology = window.__TOPOLOGY__ || {};
+let semanticGeometry = window.__SEMANTIC_GEOMETRY__ || {};
+let viewerRoot = document;
+let appEl;
+let canvas;
+let schematicCanvas;
+let schematicDomLayer;
+let schematicFlowOverlay;
+let statusEl;
+let viewerKindEl;
+let selectionEl;
+let diagnosticsEl;
+let layersEl;
+let searchControlsEl;
+let viewControlsEl;
+let fallbackEl;
+let labelsEl;
+let schematicLabelsEl;
+let gizmo;
+let selectionCardEl;
+let primaryHeadingEl;
+let primaryDescriptionEl;
+
+const query = (selector) => viewerRoot.querySelector(selector);
+const queryAll = (selector) => viewerRoot.querySelectorAll(selector);
+
+function resolveDom(root = document) {
+  viewerRoot = root;
+  appEl = query("#app");
+  canvas = query("#viewport");
+  schematicCanvas = query("#schematic-viewport");
+  schematicDomLayer = query("#schematic-dom-layer");
+  schematicFlowOverlay = query("#schematic-flow-overlay");
+  statusEl = query("#status");
+  viewerKindEl = query("#viewer-kind");
+  selectionEl = query("#selection");
+  diagnosticsEl = query("#diagnostics");
+  layersEl = query("#layers");
+  searchControlsEl = query("#search-controls");
+  viewControlsEl = query("#view-controls");
+  fallbackEl = query("#fallback");
+  labelsEl = query("#panel-labels");
+  schematicLabelsEl = query("#schematic-labels");
+  gizmo = query("#axis-gizmo");
+  selectionCardEl = query("#selection-card");
+  primaryHeadingEl = query("#primary-heading");
+  primaryDescriptionEl = query("#primary-description");
+}
 
 const state = {
   workspace: "pcb",
@@ -135,12 +162,41 @@ let panel;
 let compareOffsets = new Map();
 let lastFrame = performance.now();
 
-boot().catch((error) => {
-  console.error(error);
-  statusEl.textContent = "Renderer failed";
-  fallbackEl.hidden = false;
-  fallbackEl.textContent = error.stack || error.message || String(error);
-});
+if (!window.__PRISM_SEMANTIC_VIEWER_MANUAL_BOOT__ && document.getElementById("app")) {
+  mountStandaloneViewer().catch((error) => {
+    console.error(error);
+    if (statusEl) statusEl.textContent = "Renderer failed";
+    if (fallbackEl) {
+      fallbackEl.hidden = false;
+      fallbackEl.textContent = error.stack || error.message || String(error);
+    }
+  });
+}
+
+export async function mountStandaloneViewer(options = {}) {
+  topology = options.topology || window.__TOPOLOGY__ || {};
+  semanticGeometry = options.semanticGeometry || window.__SEMANTIC_GEOMETRY__ || {};
+  resolveDom(options.root || document);
+  if (!appEl || !canvas) throw new Error("Semantic viewer shell is missing required DOM nodes");
+  await boot();
+  return {
+    setSelection(selection) {
+      if (selection?.netId) selectNet(Number(selection.netId), true);
+      else if (selection?.featureId) selectFeature(Number(selection.featureId), true);
+    },
+    resize() {
+      renderer?.resize();
+      schematicRenderer?.resize();
+    },
+    dispose() {
+      window.removeEventListener("keydown", handleKey);
+      renderer = null;
+      schematicRenderer = null;
+      schematicDomRenderer?.dispose?.();
+      schematicDomRenderer = null;
+    },
+  };
+}
 
 async function boot() {
   const manifestPath = semanticGeometry.assets?.scene_manifest || semanticGeometry.semantic_gltf?.path;
@@ -188,6 +244,7 @@ async function boot() {
   bindSchematicInteractions();
   bindWorkspaceTabs();
   bindPanelTabs();
+  bindGizmoInteraction();
   statusEl.textContent = "WebGPU semantic glTF active";
   void loadComponents();
   scheduleTileResidency(performance.now(), { force: true });
@@ -200,7 +257,7 @@ async function loadSchematicWorld() {
     || semanticGeometry.schematic_scene?.path;
   const fallbackPath = semanticGeometry.assets?.schematic_manifest
     || semanticGeometry.schematic_world?.path;
-  const tab = document.querySelector("[data-workspace=schematic]");
+  const tab = query("[data-workspace=schematic]");
   if (!nativePath && !fallbackPath) {
     tab.disabled = true;
     tab.title = "No schematic world assets are available";
@@ -914,8 +971,8 @@ function renderControls() {
   viewerKindEl.textContent = "Semantic GLTF A0";
   primaryHeadingEl.textContent = "Layers";
   primaryDescriptionEl.textContent = "Visibility and compare";
-  document.querySelector('[data-panel="search"] .section-heading span').textContent = "Nets, components and pins";
-  document.querySelector('[data-panel="view"] .section-heading span').textContent = "Camera and stackup";
+  query('[data-panel="search"] .section-heading span').textContent = "Nets, components and pins";
+  query('[data-panel="view"] .section-heading span').textContent = "Camera and stackup";
   layersEl.innerHTML = `
     <div class="mode-toolbar">
       <button data-mode="layer">Layer Compare</button>
@@ -960,8 +1017,8 @@ function renderSchematicControls() {
     : "Schematic World A0";
   primaryHeadingEl.textContent = "Pages";
   primaryDescriptionEl.textContent = `${schematicScene.pages.length} hierarchy instances`;
-  document.querySelector('[data-panel="search"] .section-heading span').textContent = "Pages, nets and components";
-  document.querySelector('[data-panel="view"] .section-heading span').textContent = "World navigation";
+  query('[data-panel="search"] .section-heading span').textContent = "Pages, nets and components";
+  query('[data-panel="view"] .section-heading span').textContent = "World navigation";
   layersEl.innerHTML = `
     <div class="layer-presets">
       <button data-page-action="world">Fit world</button>
@@ -1284,15 +1341,15 @@ function bindControlEvents() {
 }
 
 function bindPanelTabs() {
-  document.querySelectorAll(".rail-tab").forEach((button) => button.addEventListener("click", () => {
+  queryAll(".rail-tab").forEach((button) => button.addEventListener("click", () => {
     const tab = button.dataset.tab;
     const closing = state.activeTab === tab && !appEl.classList.contains("panel-collapsed");
     state.activeTab = tab;
     appEl.classList.toggle("panel-collapsed", closing);
-    document.querySelectorAll(".rail-tab").forEach((item) => {
+    queryAll(".rail-tab").forEach((item) => {
       item.classList.toggle("active", !closing && item.dataset.tab === tab);
     });
-    document.querySelectorAll(".tab-panel").forEach((item) => {
+    queryAll(".tab-panel").forEach((item) => {
       item.classList.toggle("active", !closing && item.dataset.panel === tab);
     });
   }));
@@ -1604,7 +1661,7 @@ function bindInteractions() {
 }
 
 function bindWorkspaceTabs() {
-  document.querySelectorAll("[data-workspace]").forEach((button) => {
+  queryAll("[data-workspace]").forEach((button) => {
     button.addEventListener("click", () => switchWorkspace(button.dataset.workspace));
   });
 }
@@ -1620,7 +1677,7 @@ function switchWorkspace(workspace) {
   gizmo.hidden = schematic;
   labelsEl.hidden = schematic;
   schematicLabelsEl.hidden = !schematic;
-  document.querySelectorAll("[data-workspace]").forEach((button) => {
+  queryAll("[data-workspace]").forEach((button) => {
     button.classList.toggle("active", button.dataset.workspace === workspace);
   });
   statusEl.textContent = schematic
@@ -1787,10 +1844,10 @@ function handleKey(event) {
 function openTab(tab) {
   state.activeTab = tab;
   appEl.classList.remove("panel-collapsed");
-  document.querySelectorAll(".rail-tab").forEach((item) => {
+  queryAll(".rail-tab").forEach((item) => {
     item.classList.toggle("active", item.dataset.tab === tab);
   });
-  document.querySelectorAll(".tab-panel").forEach((item) => {
+  queryAll(".tab-panel").forEach((item) => {
     item.classList.toggle("active", item.dataset.panel === tab);
   });
 }
@@ -1853,16 +1910,20 @@ function drawGizmo() {
   }
 }
 
-gizmo.addEventListener("click", (event) => {
-  const scaleX = gizmo.width / gizmo.clientWidth;
-  const scaleY = gizmo.height / gizmo.clientHeight;
-  const point = [event.offsetX * scaleX, event.offsetY * scaleY];
-  const hit = gizmoHits
-    .map((item) => ({ item, distance: Math.hypot(point[0] - item.point[0], point[1] - item.point[1]) }))
-    .filter(({ item, distance }) => distance <= item.radius)
-    .sort((a, b) => a.distance - b.distance)[0]?.item;
-  if (hit) camera.setAxis(hit.axis, hit.sign < 0);
-});
+function bindGizmoInteraction() {
+  if (!gizmo || gizmo.dataset.bound === "true") return;
+  gizmo.dataset.bound = "true";
+  gizmo.addEventListener("click", (event) => {
+    const scaleX = gizmo.width / gizmo.clientWidth;
+    const scaleY = gizmo.height / gizmo.clientHeight;
+    const point = [event.offsetX * scaleX, event.offsetY * scaleY];
+    const hit = gizmoHits
+      .map((item) => ({ item, distance: Math.hypot(point[0] - item.point[0], point[1] - item.point[1]) }))
+      .filter(({ item, distance }) => distance <= item.radius)
+      .sort((a, b) => a.distance - b.distance)[0]?.item;
+    if (hit) camera.setAxis(hit.axis, hit.sign < 0);
+  });
+}
 
 function updateLayerLabels() {
   if (state.mode !== "layer" || !panel) {
