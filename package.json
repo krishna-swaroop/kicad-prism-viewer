@@ -1,10 +1,28 @@
 {
-  "name": "kicad-3d-viz-dev-tools",
+  "name": "@kicad-prism/semantic-viewer",
+  "version": "0.1.0",
   "private": true,
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./react": {
+      "import": "./dist/react/index.js"
+    },
+    "./standalone": {
+      "import": "./dist/standalone/index.js"
+    },
+    "./styles.css": "./viewer/styles.css"
+  },
   "scripts": {
     "build:viewer": "esbuild viewer/src/main.js --bundle --minify --format=iife --platform=browser --external:node:fs --external:node:path --outfile=viewer/app.js",
+    "build:package": "esbuild viewer/src/index.js viewer/src/react/index.jsx viewer/src/standalone/index.js --bundle --splitting --format=esm --platform=browser --external:react --external:react-dom --external:node:fs --external:node:path --outdir=dist --chunk-names=chunks/[name]-[hash]",
     "test:gltf": "node --test tools/semantic-gltf/*.test.mjs",
     "bench:schematic-dom": "node tools/schematic-dom-benchmark.mjs"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0 || ^19.0.0",
+    "react-dom": "^18.0.0 || ^19.0.0"
   },
   "dependencies": {
     "@gltf-transform/core": "^4.2.1",

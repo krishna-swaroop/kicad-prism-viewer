@@ -14,27 +14,27 @@ const COMPARE_REVEAL_DURATION_MS = 230;
 const TILE_VERTEX_STRIDE_BYTES = 40;
 const TILE_INDEX_BYTES = 4;
 
-const topology = window.__TOPOLOGY__ || {};
-const semanticGeometry = window.__SEMANTIC_GEOMETRY__ || {};
-const appEl = document.getElementById("app");
-const canvas = document.getElementById("viewport");
-const schematicCanvas = document.getElementById("schematic-viewport");
-const schematicDomLayer = document.getElementById("schematic-dom-layer");
-const schematicFlowOverlay = document.getElementById("schematic-flow-overlay");
-const statusEl = document.getElementById("status");
-const viewerKindEl = document.getElementById("viewer-kind");
-const selectionEl = document.getElementById("selection");
-const diagnosticsEl = document.getElementById("diagnostics");
-const layersEl = document.getElementById("layers");
-const searchControlsEl = document.getElementById("search-controls");
-const viewControlsEl = document.getElementById("view-controls");
-const fallbackEl = document.getElementById("fallback");
-const labelsEl = document.getElementById("panel-labels");
-const schematicLabelsEl = document.getElementById("schematic-labels");
-const gizmo = document.getElementById("axis-gizmo");
-const selectionCardEl = document.getElementById("selection-card");
-const primaryHeadingEl = document.getElementById("primary-heading");
-const primaryDescriptionEl = document.getElementById("primary-description");
+let topology = window.__TOPOLOGY__ || {};
+let semanticGeometry = window.__SEMANTIC_GEOMETRY__ || {};
+let appEl;
+let canvas;
+let schematicCanvas;
+let schematicDomLayer;
+let schematicFlowOverlay;
+let statusEl;
+let viewerKindEl;
+let selectionEl;
+let diagnosticsEl;
+let layersEl;
+let searchControlsEl;
+let viewControlsEl;
+let fallbackEl;
+let labelsEl;
+let schematicLabelsEl;
+let gizmo;
+let selectionCardEl;
+let primaryHeadingEl;
+let primaryDescriptionEl;
 
 const state = {
   workspace: "pcb",
@@ -135,12 +135,59 @@ let panel;
 let compareOffsets = new Map();
 let lastFrame = performance.now();
 
-boot().catch((error) => {
+function lookup(root, selector) {
+  if (root?.querySelector) return root.querySelector(selector);
+  return document.querySelector(selector);
+}
+
+function resolveDom(root = document) {
+  appEl = lookup(root, "#app");
+  canvas = lookup(root, "#viewport");
+  schematicCanvas = lookup(root, "#schematic-viewport");
+  schematicDomLayer = lookup(root, "#schematic-dom-layer");
+  schematicFlowOverlay = lookup(root, "#schematic-flow-overlay");
+  statusEl = lookup(root, "#status");
+  viewerKindEl = lookup(root, "#viewer-kind");
+  selectionEl = lookup(root, "#selection");
+  diagnosticsEl = lookup(root, "#diagnostics");
+  layersEl = lookup(root, "#layers");
+  searchControlsEl = lookup(root, "#search-controls");
+  viewControlsEl = lookup(root, "#view-controls");
+  fallbackEl = lookup(root, "#fallback");
+  labelsEl = lookup(root, "#panel-labels");
+  schematicLabelsEl = lookup(root, "#schematic-labels");
+  gizmo = lookup(root, "#axis-gizmo");
+  selectionCardEl = lookup(root, "#selection-card");
+  primaryHeadingEl = lookup(root, "#primary-heading");
+  primaryDescriptionEl = lookup(root, "#primary-description");
+}
+
+function reportBootError(error) {
   console.error(error);
-  statusEl.textContent = "Renderer failed";
-  fallbackEl.hidden = false;
-  fallbackEl.textContent = error.stack || error.message || String(error);
-});
+  if (statusEl) statusEl.textContent = "Renderer failed";
+  if (fallbackEl) {
+    fallbackEl.hidden = false;
+    fallbackEl.textContent = error.stack || error.message || String(error);
+  }
+}
+
+export async function mountStandaloneViewer(options = {}) {
+  topology = options.topology || window.__TOPOLOGY__ || {};
+  semanticGeometry = options.semanticGeometry || window.__SEMANTIC_GEOMETRY__ || {};
+  resolveDom(options.root || document);
+  await boot();
+  return {
+    dispose() {
+      renderer?.dispose?.();
+      schematicRenderer?.dispose?.();
+      schematicDomRenderer?.dispose?.();
+    },
+  };
+}
+
+if (!window.__PRISM_SEMANTIC_VIEWER_MANUAL_BOOT__) {
+  mountStandaloneViewer().catch(reportBootError);
+}
 
 async function boot() {
   const manifestPath = semanticGeometry.assets?.scene_manifest || semanticGeometry.semantic_gltf?.path;
