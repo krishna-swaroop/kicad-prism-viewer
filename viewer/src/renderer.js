@@ -292,10 +292,10 @@ export class Renderer {
         { shaderLocation: 5, offset: 36, format: "uint32" },
       ],
     }];
-    this.pipeline = this.makePipeline(layout, MAIN_SHADER, this.format, vertexBuffers);
-    this.pickPipeline = this.makePipeline(layout, PICK_SHADER, "r32uint", vertexBuffers);
-    this.barrelPipeline = this.makeBarrelPipeline(layout, BARREL_SHADER, this.format);
-    this.barrelPickPipeline = this.makeBarrelPipeline(layout, BARREL_PICK_SHADER, "r32uint");
+    this.pipeline = this.makePipeline(layout, MAIN_SHADER, this.format, vertexBuffers, "main");
+    this.pickPipeline = this.makePipeline(layout, PICK_SHADER, "r32uint", vertexBuffers, "pick");
+    this.barrelPipeline = this.makeBarrelPipeline(layout, BARREL_SHADER, this.format, "barrel");
+    this.barrelPickPipeline = this.makeBarrelPipeline(layout, BARREL_PICK_SHADER, "r32uint", "barrel-pick");
     this.depth = null;
     this.pickTexture = null;
     this.pickSerial = Promise.resolve();
@@ -308,8 +308,8 @@ export class Renderer {
     this.nextEntryId = 1;
   }
 
-  makePipeline(layout, code, format, buffers) {
-    const module = this.device.createShaderModule({ code });
+  makePipeline(layout, code, format, buffers, label) {
+    const module = this.createShaderModule(code, label);
     return this.device.createRenderPipeline({
       layout,
       vertex: { module, entryPoint: "vs", buffers },
@@ -330,8 +330,8 @@ export class Renderer {
     });
   }
 
-  makeBarrelPipeline(layout, code, format) {
-    const module = this.device.createShaderModule({ code });
+  makeBarrelPipeline(layout, code, format, label) {
+    const module = this.createShaderModule(code, label);
     return this.device.createRenderPipeline({
       layout,
       vertex: {
@@ -371,6 +371,24 @@ export class Renderer {
       primitive: { topology: "triangle-list", cullMode: "none" },
       depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
     });
+  }
+
+  createShaderModule(code, label) {
+    const module = this.device.createShaderModule({ label: `pcb-${label}`, code });
+    if (typeof module.getCompilationInfo === "function") {
+      void module.getCompilationInfo().then((info) => {
+        const messages = [...info.messages || []];
+        if (!messages.length) return;
+        console.groupCollapsed(`WebGPU shader compilation info: pcb-${label}`);
+        for (const message of messages) {
+          console[message.type === "error" ? "error" : "warn"](
+            `${message.type} ${message.lineNum}:${message.linePos} ${message.message}`,
+          );
+        }
+        console.groupEnd();
+      });
+    }
+    return module;
   }
 
   resize() {

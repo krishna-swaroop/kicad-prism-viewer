@@ -106,6 +106,7 @@ def cmd_from_project(args: argparse.Namespace) -> None:
                 pcb_ir,
                 args.output,
                 pad_holes=pad_holes,
+                force_rebuild=args.force_rebuild,
                 progress=_progress,
             )
         semantic_geometry["assets"]["scene_manifest"] = "scene-gltf/scene.manifest.json"
@@ -191,6 +192,7 @@ def main() -> None:
     from_project.add_argument("project", type=Path)
     from_project.add_argument("--output", type=Path, required=True)
     from_project.add_argument("--strict-components", action="store_true", help="Fail if component model export cannot complete")
+    from_project.add_argument("--force-rebuild", action="store_true", help="Ignore cached generated viewer assets")
     from_project.set_defaults(func=cmd_from_project)
 
     schematic_world = sub.add_parser(

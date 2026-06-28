@@ -71,17 +71,24 @@ function escapeHtml(value) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, { cache: "default" });
+  const response = await fetch(url, { cache: "no-store" });
   if (!response.ok) throw new Error(`Failed to load ${url}: ${response.status}`);
   return response.json();
 }
 
-function absolutizeAssetPaths(semanticGeometry, bundleUrl, bundle) {
+function withCacheKey(url, cacheKey) {
+  if (!cacheKey) return url;
+  const next = new URL(url);
+  next.searchParams.set("viewer", cacheKey);
+  return next.toString();
+}
+
+function absolutizeAssetPaths(semanticGeometry, bundleUrl, bundle, cacheKey) {
   const assetBase = new URL(bundle.asset_base || "./", bundleUrl);
   const output = structuredClone(semanticGeometry || {});
   const absolutize = (value) => {
     if (!value || typeof value !== "string") return value;
-    return new URL(value, assetBase).toString();
+    return withCacheKey(new URL(value, assetBase).toString(), cacheKey);
   };
   for (const groupName of ["assets", "semantic_gltf", "schematic_world", "schematic_vector", "schematic_scene"]) {
     const group = output[groupName];
@@ -93,6 +100,7 @@ function absolutizeAssetPaths(semanticGeometry, bundleUrl, bundle) {
 
 async function loadBundle(bundleUrl) {
   const absoluteBundleUrl = new URL(bundleUrl, document.baseURI).toString();
+  const cacheKey = new URL(absoluteBundleUrl).searchParams.get("viewer") || "";
   const bundle = await fetchJson(absoluteBundleUrl);
   if (bundle.schema !== SUPPORTED_SCHEMA) {
     throw new Error(`Unsupported visualizer bundle schema: ${bundle.schema || "missing"}`);
@@ -106,7 +114,7 @@ async function loadBundle(bundleUrl) {
   return {
     bundle,
     topology,
-    semanticGeometry: absolutizeAssetPaths(semanticGeometry, absoluteBundleUrl, bundle),
+    semanticGeometry: absolutizeAssetPaths(semanticGeometry, absoluteBundleUrl, bundle, cacheKey),
   };
 }
 

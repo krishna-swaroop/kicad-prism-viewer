@@ -581,6 +581,7 @@ def build_semantic_gltf_scene(
     *,
     pad_holes: dict[str, dict[str, Any]] | None = None,
     tile_size_mm: float = TILE_SIZE_MM,
+    force_rebuild: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     assets = semantic_geometry.get("assets", {})
@@ -615,13 +616,26 @@ def build_semantic_gltf_scene(
     existing_manifest = None
     if manifest_path.exists():
         existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_files_complete = False
+    if existing_manifest:
+        manifest_files_complete = all(
+            (manifest_path.parent / str(tile.get("path") or "")).is_file()
+            for tile in existing_manifest.get("tiles", [])
+        )
     cache_hit = bool(
+        not force_rebuild
+        and
         existing_manifest
         and existing_manifest.get("geometryRevision") == payload["geometryRevision"]
+        and manifest_files_complete
     )
     if not cache_hit:
         shutil.rmtree(scene_dir, ignore_errors=True)
         if progress:
+            if force_rebuild:
+                progress("semantic GLTF scene cache bypassed by force rebuild")
+            elif existing_manifest and existing_manifest.get("geometryRevision") == payload["geometryRevision"] and not manifest_files_complete:
+                progress("semantic GLTF scene cache invalid: manifest references missing tile files")
             progress("semantic GLTF node builder: start")
         proc = subprocess.run(
             ["node", str(tool), str(input_path), str(scene_dir)],
@@ -641,6 +655,15 @@ def build_semantic_gltf_scene(
     elif progress:
         progress(f"semantic GLTF scene cache hit revision={payload['geometryRevision'][:12]}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    missing_tiles = [
+        str(tile.get("path") or "")
+        for tile in manifest.get("tiles", [])
+        if not (manifest_path.parent / str(tile.get("path") or "")).is_file()
+    ]
+    if missing_tiles:
+        preview = ", ".join(missing_tiles[:8])
+        suffix = "" if len(missing_tiles) <= 8 else f", ... +{len(missing_tiles) - 8} more"
+        raise RuntimeError(f"semantic GLTF manifest references missing tile files: {preview}{suffix}")
     if progress:
         progress(
             "semantic GLTF manifest "

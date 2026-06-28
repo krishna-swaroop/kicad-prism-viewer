@@ -322,6 +322,10 @@ async function loadTile(tile) {
     resident.lastUsed = performance.now();
     return;
   }
+  const failed = scene.failed.get(tile.id);
+  if (failed) {
+    return;
+  }
   if (scene.loading.has(tile.id)) return scene.loading.get(tile.id);
   const promise = (async () => {
     try {
@@ -364,8 +368,9 @@ async function loadTile(tile) {
     } catch (error) {
       const previous = scene.failed.get(tile.id) || { count: 0, message: "" };
       scene.failed.set(tile.id, { count: previous.count + 1, message: error?.message || String(error) });
-      console.warn(`Failed to load tile ${tile.id}`, error);
-      throw error;
+      if (!previous.count) {
+        console.warn(`Failed to load tile ${tile.id}; suppressing retries until assets are regenerated`, error);
+      }
     } finally {
       scene.loading.delete(tile.id);
     }
@@ -408,7 +413,7 @@ function scheduleTileResidency(now = performance.now(), options = {}) {
   const loadBudget = Math.max(0, maxLoads - activeLoads);
   const missing = [...needed]
     .map((tileId) => scene.tiles.get(tileId))
-    .filter((tile) => tile && !scene.residentTiles.has(tile.id) && !scene.loading.has(tile.id))
+    .filter((tile) => tile && !scene.residentTiles.has(tile.id) && !scene.loading.has(tile.id) && !scene.failed.has(tile.id))
     .sort((a, b) => tileDistanceToFocus(a) - tileDistanceToFocus(b))
     .slice(0, loadBudget);
   for (const tile of missing) void loadTile(tile);

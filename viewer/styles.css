@@ -1,3 +1,4 @@
+:host,
 :root {
   color-scheme: dark;
   --shell: #070b13;
@@ -11,6 +12,16 @@
   --primary: #3b82f6;
   --surface: #edf1f4;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+:host {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--shell);
+  color: var(--foreground);
 }
 
 * {
@@ -33,7 +44,10 @@ input {
 #app {
   display: grid;
   grid-template-columns: 48px minmax(0, 1fr) 376px;
-  height: 100vh;
+  height: 100%;
+  min-height: 0;
+  background: var(--shell);
+  color: var(--foreground);
   transition: grid-template-columns 180ms ease;
 }
 
