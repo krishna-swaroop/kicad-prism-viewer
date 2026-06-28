@@ -54,7 +54,13 @@ struct VertexOut {
   if (nativeDetail) {
     return vec4f(0.925, 0.918, 0.865, 1.0);
   }
-  let dim = select(1.0, select(0.42, 1.0, containsNet), hasActiveNet);
+  var dim = 1.0;
+  if (hasActiveNet) {
+    dim = 0.42;
+    if (containsNet) {
+      dim = 1.0;
+    }
+  }
   return vec4f(sampled.rgb * dim, 1.0);
 }`;
 
@@ -132,8 +138,12 @@ struct Out {
 @fragment fn fs(input: Out) -> @location(0) vec4f {
   let selected = input.kind > 1.5;
   let intersheet = input.kind > 0.5 && !selected;
-  let speed = select(0.62, 0.88, intersheet || selected);
-  let period = select(18.0, 28.0, intersheet || selected);
+  var speed = 0.62;
+  var period = 18.0;
+  if (intersheet || selected) {
+    speed = 0.88;
+    period = 28.0;
+  }
   let phase = fract(input.distance / period - globals.camera.w * speed);
   let dash = smoothstep(0.04, 0.13, phase) * (1.0 - smoothstep(0.38, 0.52, phase));
   let intraBase = vec3f(0.94, 0.48, 0.12);
@@ -142,10 +152,24 @@ struct Out {
   let interDash = vec3f(0.42, 0.82, 1.0);
   let selectedBase = vec3f(0.08, 1.0, 0.34);
   let selectedDash = vec3f(0.86, 1.0, 0.72);
-  let base = select(select(intraBase, interBase, intersheet), selectedBase, selected);
-  let bright = select(select(intraDash, interDash, intersheet), selectedDash, selected);
+  var base = intraBase;
+  var bright = intraDash;
+  if (intersheet) {
+    base = interBase;
+    bright = interDash;
+  }
+  if (selected) {
+    base = selectedBase;
+    bright = selectedDash;
+  }
   let color = base + (bright - base) * dash;
-  let alpha = select(select(0.24, 0.30, intersheet) + dash * 0.54, 0.44 + dash * 0.50, selected);
+  var alpha = 0.24 + dash * 0.54;
+  if (intersheet) {
+    alpha = 0.30 + dash * 0.54;
+  }
+  if (selected) {
+    alpha = 0.44 + dash * 0.50;
+  }
   return vec4f(color, alpha);
 }`;
 

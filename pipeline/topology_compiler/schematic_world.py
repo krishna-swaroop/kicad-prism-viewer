@@ -5,7 +5,7 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 SCHEMA = "prism.schematic_world_a0"
@@ -196,6 +196,8 @@ def build_schematic_world(
     design: Any,
     design_payload: dict[str, Any],
     output_dir: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     from kicad_monkey import KiCadSvgRenderOptions, render_ir_to_svg  # type: ignore
     from kicad_monkey.kicad_schematic_svg_enrichment import (  # type: ignore
@@ -212,7 +214,10 @@ def build_schematic_world(
     instance_to_page: dict[str, str] = {}
     options = KiCadSvgRenderOptions.enriched_default()
 
-    for index, instance in enumerate(design.schematic_instances(), start=1):
+    instances = list(design.schematic_instances())
+    if progress:
+        progress(f"schematic world pages={len(instances)}")
+    for index, instance in enumerate(instances, start=1):
         ir = design.to_schematic_instance_ir(instance)
         page_id = f"page-{index:04d}"
         instance_path = str(getattr(instance, "sheet_instance_path", "") or "")
@@ -265,6 +270,8 @@ def build_schematic_world(
                 "netUids": sorted(str(uid) for uid in net_map),
             }
         )
+        if progress and (index == len(instances) or index % 5 == 0):
+            progress(f"schematic world rendered pages={index}/{len(instances)}")
 
     for page in pages:
         page["parentId"] = instance_to_page.get(page["parentSheetInstancePath"], "")
@@ -326,6 +333,8 @@ def build_schematic_world(
         json.dumps(manifest, separators=(",", ":")),
         encoding="utf-8",
     )
+    if progress:
+        progress(f"schematic world manifest pages={len(pages)} features={sum(page['featureCount'] for page in pages)}")
     return {
         "schema": SCHEMA,
         "path": "schematic-world/schematic.manifest.json",

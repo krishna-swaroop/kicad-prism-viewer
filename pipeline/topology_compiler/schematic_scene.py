@@ -10,7 +10,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .schematic_world import (
     _hierarchy_depth,
@@ -1755,6 +1755,8 @@ def build_schematic_scene(
     design_payload: dict[str, Any],
     output_dir: Path,
     topology: dict[str, Any] | None = None,
+    *,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     from kicad_monkey import KiCadSvgRenderOptions, render_ir_to_svg  # type: ignore
     from kicad_monkey.kicad_schematic_svg_enrichment import (  # type: ignore
@@ -1801,7 +1803,11 @@ def build_schematic_scene(
     pin_lookup = _pin_lookup_indexes(design_payload, topology, component_by_designator)
     topology_graphical_nets = _topology_graphical_net_candidates(topology)
 
-    for index, instance in enumerate(design.schematic_instances(), start=1):
+    instances = list(design.schematic_instances())
+    if progress:
+        progress(f"schematic vector pages={len(instances)}")
+
+    for index, instance in enumerate(instances, start=1):
         ir = design.to_schematic_instance_ir(instance)
         page_id = f"page-{index:04d}"
         instance_path = str(getattr(instance, "sheet_instance_path", "") or "")
@@ -1985,6 +1991,8 @@ def build_schematic_scene(
         }
         pages.append(page)
         page_records[page_id] = list(getattr(ir, "records", []) or [])
+        if progress and (index == len(instances) or index % 5 == 0):
+            progress(f"schematic vector indexed pages={index}/{len(instances)}")
 
     for page in pages:
         page["parentId"] = instance_to_page.get(page["parentSheetInstancePath"], "")
@@ -2039,7 +2047,7 @@ def build_schematic_scene(
     ]
 
     features_by_id = {feature["id"]: feature for feature in features}
-    for page in pages:
+    for page_index, page in enumerate(pages, start=1):
         page_chunk_dir = chunk_dir / page["id"]
         page_chunk_dir.mkdir(parents=True, exist_ok=True)
         page_features = [features_by_id[feature_id] for feature_id in page["featureIds"]]
@@ -2071,6 +2079,8 @@ def build_schematic_scene(
                 source_svg_by_page.get(page["id"], ""),
             )
         )
+        if progress and (page_index == len(pages) or page_index % 5 == 0):
+            progress(f"schematic vector wrote chunks={page_index}/{len(pages)}")
 
     strings = sorted(
         {
@@ -2235,6 +2245,11 @@ def build_schematic_scene(
         json.dumps(manifest, separators=(",", ":")),
         encoding="utf-8",
     )
+    if progress:
+        progress(
+            "schematic vector manifest "
+            f"pages={len(pages)} features={len(features)} unsupported={len(unsupported_operations)}"
+        )
     return {
         "schema": SCHEMA,
         "path": "schematic-vector/schematic.vector.manifest.json",

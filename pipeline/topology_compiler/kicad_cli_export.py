@@ -10,7 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DEFAULT_KICAD_CLI = Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")
@@ -57,6 +57,7 @@ def export_project_geometry(
     output_dir: Path,
     *,
     strict_components: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Export KiCad-owned 3D geometry and a semantic sidecar.
 
@@ -75,6 +76,8 @@ def export_project_geometry(
     cache_dir.mkdir(parents=True, exist_ok=True)
     pcb_hash = hashlib.sha256(pcb_file.read_bytes()).hexdigest()
     cli_version = _cli_version(cli)
+    if progress:
+        progress(f"kicad-cli version={cli_version} pcb={pcb_file.name}")
 
     exports: list[ExportResult] = []
     exports.append(
@@ -84,6 +87,7 @@ def export_project_geometry(
             _board_context_export_args(geometry_dir, pcb_file),
             cache_dir=cache_dir,
             cache_key=f"{pcb_hash}-{cli_version}-{BOARD_CONTEXT_CACHE_VERSION}",
+            progress=progress,
         )
     )
     component_export = _run_cached_export(
@@ -102,6 +106,7 @@ def export_project_geometry(
         check=strict_components,
         cache_dir=cache_dir,
         cache_key=f"{pcb_hash}-{cli_version}-components",
+        progress=progress,
     )
     exports.append(component_export)
     if strict_components and not component_export.path.exists():
@@ -112,6 +117,8 @@ def export_project_geometry(
         for net in topology.get("nets", [])
         if str(net.get("name") or "") and not str(net.get("name") or "").startswith("unconnected-")
     ]
+    if progress:
+        progress(f"semantic geometry metadata connected_nets={len(connected_nets)} components={len(topology.get('components', []) or [])}")
     manifest = {
         "schema": "prism.semantic_geometry_a0",
         "generator": "kicad-cli",
@@ -174,16 +181,24 @@ def _run_cached_export(
     cache_dir: Path,
     cache_key: str,
     check: bool = True,
+    progress: Callable[[str], None] | None = None,
 ) -> ExportResult:
     output_path = Path(args[args.index("--output") + 1])
     cache_path = cache_dir / f"{_slug(cache_key)}{output_path.suffix}"
     if cache_path.exists() and cache_path.stat().st_size:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(cache_path, output_path)
+        if progress:
+            progress(f"kicad-cli export {label}: cache hit ({output_path.stat().st_size / 1_000_000:.1f} MB)")
         return ExportResult(label, [str(cli), *args], output_path, 0, "cache hit", "")
+    if progress:
+        progress(f"kicad-cli export {label}: start")
     result = _run_export(label, cli, args, check=check)
     if result.path.exists() and result.path.stat().st_size:
         shutil.copy2(result.path, cache_path)
+    if progress:
+        size_mb = result.path.stat().st_size / 1_000_000 if result.path.exists() else 0.0
+        progress(f"kicad-cli export {label}: done {result.elapsed_ms / 1000:.1f}s ({size_mb:.1f} MB)")
     return result
 
 

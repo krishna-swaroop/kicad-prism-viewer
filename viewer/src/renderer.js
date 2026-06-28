@@ -83,7 +83,10 @@ fn aces(color: vec3f) -> vec3f {
   let metallic = clamp(draw.material.x, 0.0, 1.0);
   let specular = pow(max(dot(normal, normalize(light + vec3f(0.3, -0.4, 0.85))), 0.0), mix(96.0, 6.0, roughness));
   let shaded = base * (hemi + diffuse * 0.72) + mix(vec3f(0.04), base, metallic) * specular * 0.5;
-  var lit = select(shaded, base, draw.flags.w > 0.5);
+  var lit = shaded;
+  if (draw.flags.w > 0.5) {
+    lit = base;
+  }
   return vec4f(aces(lit), draw.flags.y);
 }
 `;
@@ -171,7 +174,10 @@ struct Output {
   output.normal = input.normal;
   output.netId = input.ids.x;
   output.objectId = input.ids.y;
-  output.visible = select(0u, 1u, globals.selectedLayer == 0u || (globals.selectedLayer >= input.ids.z && globals.selectedLayer <= input.ids.w));
+  output.visible = 0u;
+  if (globals.selectedLayer == 0u || (globals.selectedLayer >= input.ids.z && globals.selectedLayer <= input.ids.w)) {
+    output.visible = 1u;
+  }
   return output;
 }
 @fragment fn fs(input: Output) -> @location(0) vec4f {
@@ -230,7 +236,10 @@ struct Output {
   var output: Output;
   output.position = globals.viewProjection * vec4f(world, 1.0);
   output.objectId = input.ids.y;
-  output.visible = select(0u, 1u, globals.selectedLayer == 0u || (globals.selectedLayer >= input.ids.z && globals.selectedLayer <= input.ids.w));
+  output.visible = 0u;
+  if (globals.selectedLayer == 0u || (globals.selectedLayer >= input.ids.z && globals.selectedLayer <= input.ids.w)) {
+    output.visible = 1u;
+  }
   return output;
 }
 @fragment fn fs(input: Output) -> @location(0) u32 {

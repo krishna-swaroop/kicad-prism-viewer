@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .glb_inspect import mesh_axis_range
 from .pcb_geometry import (
@@ -581,13 +581,24 @@ def build_semantic_gltf_scene(
     *,
     pad_holes: dict[str, dict[str, Any]] | None = None,
     tile_size_mm: float = TILE_SIZE_MM,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     assets = semantic_geometry.get("assets", {})
     base_asset = str(assets.get("base_board_glb") or "")
     base_path = output_dir / base_asset if base_asset else None
     builder = SemanticGltfBuilder(topology, base_path)
-    builder.add_pcb_ir(pcb_ir, pad_holes=pad_holes)
+    pcb_payload = pcb_ir.to_dict() if hasattr(pcb_ir, "to_dict") else pcb_ir
+    if progress:
+        records = pcb_payload.get("records", []) if isinstance(pcb_payload, dict) else []
+        progress(f"semantic GLTF collect PCB IR records={len(records)}")
+    builder.add_pcb_ir(pcb_payload, pad_holes=pad_holes)
     builder.add_component_nodes(semantic_geometry.get("components", []) or [])
+    if progress:
+        progress(
+            "semantic GLTF collected "
+            f"objects={len(builder.objects)} barrels={len(builder.barrels)} "
+            f"features={len(builder.object_features)} nets={len(builder.nets) - 1}"
+        )
     scene_dir = output_dir / "scene-gltf"
     tool = Path(__file__).resolve().parents[2] / "tools" / "semantic-gltf" / "build.mjs"
     cache_dir = output_dir.parent / ".cache" / "semantic-gltf"
@@ -598,6 +609,8 @@ def build_semantic_gltf_scene(
         input_path = cache_dir / f"{payload['geometryRevision']}.json"
         if not input_path.exists():
             input_path.write_bytes(scratch_input.read_bytes())
+    if progress:
+        progress(f"semantic GLTF input revision={payload['geometryRevision'][:12]} bytes={input_path.stat().st_size / 1_000_000:.1f} MB")
     manifest_path = scene_dir / "scene.manifest.json"
     existing_manifest = None
     if manifest_path.exists():
@@ -608,14 +621,32 @@ def build_semantic_gltf_scene(
     )
     if not cache_hit:
         shutil.rmtree(scene_dir, ignore_errors=True)
+        if progress:
+            progress("semantic GLTF node builder: start")
         proc = subprocess.run(
             ["node", str(tool), str(input_path), str(scene_dir)],
             capture_output=True,
             text=True,
         )
+        if progress:
+            for line in (proc.stdout or "").splitlines():
+                if line.strip():
+                    progress(f"semantic GLTF node: {line.strip()}")
+            for line in (proc.stderr or "").splitlines():
+                clean = line.strip()
+                if clean and not clean.startswith("prune:"):
+                    progress(f"semantic GLTF node: {clean}")
         if proc.returncode != 0:
             raise RuntimeError(f"Semantic GLB build failed: {proc.stderr or proc.stdout}")
+    elif progress:
+        progress(f"semantic GLTF scene cache hit revision={payload['geometryRevision'][:12]}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if progress:
+        progress(
+            "semantic GLTF manifest "
+            f"tiles={len(manifest.get('tiles', []))} "
+            f"bytes={sum(int(tile.get('bytes') or 0) for tile in manifest.get('tiles', [])) / 1_000_000:.1f} MB"
+        )
     return {
         "schema": SCHEMA,
         "path": "scene-gltf/scene.manifest.json",

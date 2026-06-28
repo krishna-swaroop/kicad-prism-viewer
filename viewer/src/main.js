@@ -470,6 +470,7 @@ function unionSets(...sets) {
 }
 
 function evictUnneededTiles(needed) {
+  if (state.mode === "layer") return;
   const budget = COPPER_TILE_GPU_BUDGET_BYTES;
   if (state.residentTileGpuBytes <= budget) return;
   const candidates = [...scene.residentTiles.values()]

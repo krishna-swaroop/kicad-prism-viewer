@@ -20,8 +20,12 @@ if (!inputPath || !outputDir) {
 const input = JSON.parse(await fs.readFile(inputPath, "utf8"));
 const tileSize = Number(input.tileSizeMm || 20);
 const tiles = new Map();
+const objects = input.objects || [];
+progress(`input objects=${objects.length} barrels=${(input.barrels || []).length} tileSizeMm=${tileSize}`);
 
-for (const object of input.objects || []) {
+let objectIndex = 0;
+for (const object of objects) {
+  objectIndex += 1;
   for (const polygon of object.polygons || []) {
     const source = [[closeRing(polygon.outer), ...(polygon.holes || []).map(closeRing)]];
     const bounds = polygonBounds(polygon);
@@ -48,10 +52,14 @@ for (const object of input.objects || []) {
       tiles.set(key, entry);
     }
   }
+  if (objectIndex === objects.length || objectIndex % 1000 === 0) {
+    progress(`clipped objects=${objectIndex}/${objects.length} tiles=${tiles.size}`);
+  }
 }
 
 await fs.mkdir(outputDir, { recursive: true });
 await MeshoptEncoder.ready;
+progress(`meshopt ready tiles=${tiles.size}`);
 const io = new NodeIO()
   .registerExtensions([EXTMeshFeatures, EXTMeshoptCompression, KHRMeshQuantization])
   .registerDependencies({ "meshopt.encoder": MeshoptEncoder });
@@ -79,7 +87,10 @@ const manifest = {
   },
 };
 
-for (const tile of [...tiles.values()].sort(compareTiles)) {
+const sortedTiles = [...tiles.values()].sort(compareTiles);
+let tileIndex = 0;
+for (const tile of sortedTiles) {
+  tileIndex += 1;
   const geometry = buildTileGeometry(tile);
   if (!geometry.indices.length) continue;
   const document = createDocument(tile, geometry);
@@ -106,12 +117,20 @@ for (const tile of [...tiles.values()].sort(compareTiles)) {
     if (!netId) continue;
     (manifest.netToTiles[String(netId)] ||= []).push(tileId);
   }
+  if (tileIndex === sortedTiles.length || tileIndex % 25 === 0) {
+    progress(`wrote tiles=${tileIndex}/${sortedTiles.length} manifestTiles=${manifest.tiles.length}`);
+  }
 }
 
 await fs.writeFile(
   path.join(outputDir, "scene.manifest.json"),
   JSON.stringify(manifest),
 );
+progress(`done manifestTiles=${manifest.tiles.length}`);
+
+function progress(message) {
+  console.error(`[semantic-gltf] ${message}`);
+}
 
 function createDocument(tile, geometry) {
   const document = new Document();

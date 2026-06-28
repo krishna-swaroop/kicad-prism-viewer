@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .compiler import compile_topology
@@ -13,6 +15,21 @@ from .pcb_extract import extract_pcb_metadata
 from .schematic_scene import build_schematic_scene
 from .schematic_world import build_schematic_world
 from .semantic_gltf import build_semantic_gltf_scene
+
+
+def _progress(message: str) -> None:
+    print(f"[semantic-visualizer] {time.strftime('%H:%M:%S')} {message}", flush=True)
+
+
+@contextmanager
+def _stage(label: str):
+    started = time.perf_counter()
+    _progress(f"START {label}")
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - started
+        _progress(f"DONE {label} ({elapsed:.1f}s)")
 
 
 def _write_outputs(topology: dict, output_dir: Path, semantic_geometry: dict | None = None) -> None:
@@ -55,52 +72,68 @@ def _discover_project_assets(project_file: Path) -> dict:
 
 def cmd_from_project(args: argparse.Namespace) -> None:
     project_file = args.project
+    _progress(f"from-project input={project_file} output={args.output}")
     try:
-        from kicad_monkey import KiCadDesign  # type: ignore
+        with _stage("load KiCad project with kicad_monkey"):
+            from kicad_monkey import KiCadDesign  # type: ignore
 
-        design = KiCadDesign.from_project_file(project_file)
-        design_payload = design.to_json(include_indexes=True)
-        pcb_ir = design.to_pcb_ir()
-        pad_holes = extract_pad_holes(design.pcb)
-        pcb_metadata = extract_pcb_metadata(project_file)
+            design = KiCadDesign.from_project_file(project_file)
+        with _stage("compile design JSON and indexes"):
+            design_payload = design.to_json(include_indexes=True)
+        with _stage("compile PCB IR"):
+            pcb_ir = design.to_pcb_ir()
+        with _stage("extract PCB pad holes and metadata"):
+            pad_holes = extract_pad_holes(design.pcb)
+            pcb_metadata = extract_pcb_metadata(project_file)
     except Exception as exc:
         print(f"error: kicad_monkey failed to compile {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(2)
-    topology = compile_topology(design_payload, [], pcb_metadata, _discover_project_assets(project_file))
+    with _stage("compile topology model"):
+        topology = compile_topology(design_payload, [], pcb_metadata, _discover_project_assets(project_file))
     try:
-        semantic_geometry = export_project_geometry(
-            project_file,
-            topology,
-            args.output,
-            strict_components=args.strict_components,
-        )
-        semantic_geometry["semantic_gltf"] = build_semantic_gltf_scene(
-            topology,
-            semantic_geometry,
-            pcb_ir,
-            args.output,
-            pad_holes=pad_holes,
-        )
+        with _stage("export KiCad GLB context and component models"):
+            semantic_geometry = export_project_geometry(
+                project_file,
+                topology,
+                args.output,
+                strict_components=args.strict_components,
+                progress=_progress,
+            )
+        with _stage("build semantic GLTF scene tiles"):
+            semantic_geometry["semantic_gltf"] = build_semantic_gltf_scene(
+                topology,
+                semantic_geometry,
+                pcb_ir,
+                args.output,
+                pad_holes=pad_holes,
+                progress=_progress,
+            )
         semantic_geometry["assets"]["scene_manifest"] = "scene-gltf/scene.manifest.json"
-        semantic_geometry["schematic_world"] = build_schematic_world(
-            design,
-            design_payload,
-            args.output,
-        )
+        with _stage("build schematic SVG world fallback"):
+            semantic_geometry["schematic_world"] = build_schematic_world(
+                design,
+                design_payload,
+                args.output,
+                progress=_progress,
+            )
         semantic_geometry["assets"]["schematic_manifest"] = semantic_geometry["schematic_world"]["path"]
-        semantic_geometry["schematic_vector"] = build_schematic_scene(
-            design,
-            design_payload,
-            args.output,
-            topology=topology,
-        )
+        with _stage("build schematic vector/DOM semantic scene"):
+            semantic_geometry["schematic_vector"] = build_schematic_scene(
+                design,
+                design_payload,
+                args.output,
+                topology=topology,
+                progress=_progress,
+            )
         semantic_geometry["assets"]["schematic_native_manifest"] = semantic_geometry["schematic_vector"]["path"]
     except Exception as exc:
         print(f"error: semantic PCB geometry export failed for {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(3)
     topology["design"].setdefault("assets", {})["semantic_geometry"] = "semantic_geometry.json"
     topology["design"]["assets"]["geometry_mode"] = "semantic-gltf"
-    _write_outputs(topology, args.output, semantic_geometry)
+    with _stage("write final viewer bundle files"):
+        _write_outputs(topology, args.output, semantic_geometry)
+    _progress("from-project complete")
 
 
 def cmd_schematic_world(args: argparse.Namespace) -> None:
@@ -118,10 +151,20 @@ def cmd_schematic_world(args: argparse.Namespace) -> None:
     try:
         from kicad_monkey import KiCadDesign  # type: ignore
 
-        design = KiCadDesign.from_project_file(project_file)
-        design_payload = design.to_json(include_indexes=True)
-        schematic_world = build_schematic_world(design, design_payload, output_dir)
-        schematic_vector = build_schematic_scene(design, design_payload, output_dir, topology=topology)
+        with _stage("load KiCad project with kicad_monkey"):
+            design = KiCadDesign.from_project_file(project_file)
+        with _stage("compile design JSON and indexes"):
+            design_payload = design.to_json(include_indexes=True)
+        with _stage("build schematic SVG world fallback"):
+            schematic_world = build_schematic_world(design, design_payload, output_dir, progress=_progress)
+        with _stage("build schematic vector/DOM semantic scene"):
+            schematic_vector = build_schematic_scene(
+                design,
+                design_payload,
+                output_dir,
+                topology=topology,
+                progress=_progress,
+            )
     except Exception as exc:
         print(f"error: schematic world export failed for {project_file}: {exc}", file=sys.stderr)
         raise SystemExit(3)
