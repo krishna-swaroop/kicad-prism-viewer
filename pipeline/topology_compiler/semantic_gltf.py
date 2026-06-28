@@ -6,6 +6,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -582,6 +583,9 @@ def build_semantic_gltf_scene(
     pad_holes: dict[str, dict[str, Any]] | None = None,
     tile_size_mm: float = TILE_SIZE_MM,
     force_rebuild: bool = False,
+    clean_cache: bool = False,
+    cache_dir: Path | None = None,
+    meshopt_level: str = "medium",
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     assets = semantic_geometry.get("assets", {})
@@ -602,16 +606,25 @@ def build_semantic_gltf_scene(
         )
     scene_dir = output_dir / "scene-gltf"
     tool = Path(__file__).resolve().parents[2] / "tools" / "semantic-gltf" / "build.mjs"
-    cache_dir = output_dir.parent / ".cache" / "semantic-gltf"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_root = (cache_dir or (output_dir.parent / ".cache")) / "semantic-gltf"
+    input_cache_dir = cache_root / "inputs"
+    scene_cache_root = cache_root / "scenes"
+    input_cache_dir.mkdir(parents=True, exist_ok=True)
+    scene_cache_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         scratch_input = Path(tmp) / "semantic-gltf-input.json"
         payload = builder.write_input(scratch_input, tile_size_mm=tile_size_mm)
-        input_path = cache_dir / f"{payload['geometryRevision']}.json"
+        payload["meshoptLevel"] = meshopt_level
+        scratch_input.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        input_path = input_cache_dir / f"{payload['geometryRevision']}-{meshopt_level}.json"
         if not input_path.exists():
             input_path.write_bytes(scratch_input.read_bytes())
     if progress:
-        progress(f"semantic GLTF input revision={payload['geometryRevision'][:12]} bytes={input_path.stat().st_size / 1_000_000:.1f} MB")
+        progress(
+            f"semantic GLTF input revision={payload['geometryRevision'][:12]} "
+            f"bytes={input_path.stat().st_size / 1_000_000:.1f} MB "
+            f"meshopt={meshopt_level} cache={cache_root}"
+        )
     manifest_path = scene_dir / "scene.manifest.json"
     existing_manifest = None
     if manifest_path.exists():
@@ -629,29 +642,53 @@ def build_semantic_gltf_scene(
         and existing_manifest.get("geometryRevision") == payload["geometryRevision"]
         and manifest_files_complete
     )
+    persistent_scene_dir = scene_cache_root / f"{payload['geometryRevision']}-{meshopt_level}"
+    persistent_manifest_path = persistent_scene_dir / "scene.manifest.json"
+    persistent_manifest = None
+    if persistent_manifest_path.exists() and not clean_cache:
+        try:
+            persistent_manifest = json.loads(persistent_manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            persistent_manifest = None
+    persistent_scene_complete = bool(
+        persistent_manifest
+        and persistent_manifest.get("geometryRevision") == payload["geometryRevision"]
+        and all(
+            (persistent_manifest_path.parent / str(tile.get("path") or "")).is_file()
+            for tile in persistent_manifest.get("tiles", [])
+        )
+    )
     if not cache_hit:
         shutil.rmtree(scene_dir, ignore_errors=True)
-        if progress:
-            if force_rebuild:
-                progress("semantic GLTF scene cache bypassed by force rebuild")
-            elif existing_manifest and existing_manifest.get("geometryRevision") == payload["geometryRevision"] and not manifest_files_complete:
-                progress("semantic GLTF scene cache invalid: manifest references missing tile files")
-            progress("semantic GLTF node builder: start")
-        proc = subprocess.run(
-            ["node", str(tool), str(input_path), str(scene_dir)],
-            capture_output=True,
-            text=True,
-        )
-        if progress:
-            for line in (proc.stdout or "").splitlines():
-                if line.strip():
-                    progress(f"semantic GLTF node: {line.strip()}")
-            for line in (proc.stderr or "").splitlines():
-                clean = line.strip()
-                if clean and not clean.startswith("prune:"):
-                    progress(f"semantic GLTF node: {clean}")
-        if proc.returncode != 0:
-            raise RuntimeError(f"Semantic GLB build failed: {proc.stderr or proc.stdout}")
+        if persistent_scene_complete:
+            if progress:
+                progress(f"semantic GLTF persistent scene cache hit revision={payload['geometryRevision'][:12]}")
+            shutil.copytree(persistent_scene_dir, scene_dir)
+        else:
+            if progress:
+                if force_rebuild:
+                    progress("semantic GLTF output scene cache bypassed by force rebuild")
+                if clean_cache:
+                    progress("semantic GLTF persistent scene cache bypassed by clean cache")
+                elif existing_manifest and existing_manifest.get("geometryRevision") == payload["geometryRevision"] and not manifest_files_complete:
+                    progress("semantic GLTF output scene cache invalid: manifest references missing tile files")
+                elif persistent_manifest and not persistent_scene_complete:
+                    progress("semantic GLTF persistent scene cache invalid: manifest references missing tile files")
+                progress("semantic GLTF node builder: start")
+            _run_node_builder(
+                ["node", str(tool), str(input_path), str(scene_dir)],
+                progress=progress,
+            )
+            if progress:
+                progress("semantic GLTF persistent scene cache update: start")
+            temp_cache_scene = persistent_scene_dir.with_name(f"{persistent_scene_dir.name}.tmp-{int(time.time() * 1000)}")
+            shutil.rmtree(temp_cache_scene, ignore_errors=True)
+            shutil.copytree(scene_dir, temp_cache_scene)
+            if persistent_scene_dir.exists():
+                shutil.rmtree(persistent_scene_dir)
+            temp_cache_scene.rename(persistent_scene_dir)
+            if progress:
+                progress("semantic GLTF persistent scene cache update: done")
     elif progress:
         progress(f"semantic GLTF scene cache hit revision={payload['geometryRevision'][:12]}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -677,3 +714,31 @@ def build_semantic_gltf_scene(
         "tiles": len(manifest.get("tiles", [])),
         "bytes": sum(int(tile.get("bytes") or 0) for tile in manifest.get("tiles", [])),
     }
+
+
+def _run_node_builder(
+    cmd: list[str],
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> None:
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    tail: list[str] = []
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        tail.append(line)
+        tail = tail[-40:]
+        if progress:
+            progress(f"semantic GLTF node: {line}")
+    return_code = process.wait()
+    if return_code != 0:
+        detail = "\n".join(tail)
+        raise RuntimeError(f"Semantic GLB build failed with code {return_code}: {detail}")

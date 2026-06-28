@@ -107,6 +107,9 @@ def cmd_from_project(args: argparse.Namespace) -> None:
                 args.output,
                 pad_holes=pad_holes,
                 force_rebuild=args.force_rebuild,
+                clean_cache=args.clean_cache,
+                cache_dir=args.cache_dir,
+                meshopt_level=args.meshopt_level,
                 progress=_progress,
             )
         semantic_geometry["assets"]["scene_manifest"] = "scene-gltf/scene.manifest.json"
@@ -193,6 +196,14 @@ def main() -> None:
     from_project.add_argument("--output", type=Path, required=True)
     from_project.add_argument("--strict-components", action="store_true", help="Fail if component model export cannot complete")
     from_project.add_argument("--force-rebuild", action="store_true", help="Ignore cached generated viewer assets")
+    from_project.add_argument("--clean-cache", action="store_true", help="Ignore and replace persistent compiler caches")
+    from_project.add_argument("--cache-dir", type=Path, help="Persistent compiler cache directory")
+    from_project.add_argument(
+        "--meshopt-level",
+        choices=["low", "medium", "high"],
+        default="medium",
+        help="Meshoptimizer compression level for semantic GLTF tiles",
+    )
     from_project.set_defaults(func=cmd_from_project)
 
     schematic_world = sub.add_parser(

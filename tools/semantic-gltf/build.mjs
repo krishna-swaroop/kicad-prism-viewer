@@ -19,41 +19,45 @@ if (!inputPath || !outputDir) {
 
 const input = JSON.parse(await fs.readFile(inputPath, "utf8"));
 const tileSize = Number(input.tileSizeMm || 20);
+const meshoptLevel = normalizeMeshoptLevel(
+  input.meshoptLevel || process.env.PRISM_SEMANTIC_GLTF_MESHOPT_LEVEL || "medium",
+);
+const startedAt = performance.now();
 const tiles = new Map();
 const objects = input.objects || [];
-progress(`input objects=${objects.length} barrels=${(input.barrels || []).length} tileSizeMm=${tileSize}`);
+progress(`input objects=${objects.length} barrels=${(input.barrels || []).length} tileSizeMm=${tileSize} meshopt=${meshoptLevel}`);
 
 let objectIndex = 0;
+let polygonCount = 0;
+let singleTilePolygonCount = 0;
+let clippedTileCount = 0;
 for (const object of objects) {
   objectIndex += 1;
   for (const polygon of object.polygons || []) {
+    polygonCount += 1;
     const source = [[closeRing(polygon.outer), ...(polygon.holes || []).map(closeRing)]];
     const bounds = polygonBounds(polygon);
-    for (const tile of tilesForBounds(bounds, tileSize)) {
+    const polygonTiles = tilesForBounds(bounds, tileSize);
+    if (polygonTiles.length === 1) {
+      singleTilePolygonCount += 1;
+      appendTilePolygon(tiles, object, polygonTiles[0], source[0]);
+      continue;
+    }
+    for (const tile of polygonTiles) {
       const clip = [[tileRing(tile, tileSize)]];
       const clipped = polygonClipping.intersection(source, clip);
       if (!clipped?.length) continue;
-      const key = `${object.layerId}:${tile[0]}:${tile[1]}`;
-      const entry = tiles.get(key) || {
-        layerId: object.layerId,
-        layerName: object.layerName,
-        zMm: object.zMm,
-        thicknessMm: object.thicknessMm,
-        tile,
-        objects: [],
-      };
+      clippedTileCount += 1;
       for (const clippedPolygon of clipped) {
-        entry.objects.push({
-          netId: object.netId,
-          objectFeatureId: object.objectFeatureId,
-          polygon: clippedPolygon,
-        });
+        appendTilePolygon(tiles, object, tile, clippedPolygon);
       }
-      tiles.set(key, entry);
     }
   }
   if (objectIndex === objects.length || objectIndex % 1000 === 0) {
-    progress(`clipped objects=${objectIndex}/${objects.length} tiles=${tiles.size}`);
+    progress(
+      `clipped objects=${objectIndex}/${objects.length} polygons=${polygonCount} ` +
+      `singleTile=${singleTilePolygonCount} clippedTiles=${clippedTileCount} tiles=${tiles.size}`,
+    );
   }
 }
 
@@ -94,7 +98,7 @@ for (const tile of sortedTiles) {
   const geometry = buildTileGeometry(tile);
   if (!geometry.indices.length) continue;
   const document = createDocument(tile, geometry);
-  await document.transform(meshopt({ encoder: MeshoptEncoder, level: "high" }));
+  await document.transform(meshopt({ encoder: MeshoptEncoder, level: meshoptLevel }));
   const fileName = `layer-${tile.layerId}-tile-${tile.tile[0]}-${tile.tile[1]}.glb`;
   const filePath = path.join(outputDir, fileName);
   await io.write(filePath, document);
@@ -129,7 +133,32 @@ await fs.writeFile(
 progress(`done manifestTiles=${manifest.tiles.length}`);
 
 function progress(message) {
-  console.error(`[semantic-gltf] ${message}`);
+  const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+  console.error(`[semantic-gltf +${elapsedSeconds}s] ${message}`);
+}
+
+function normalizeMeshoptLevel(value) {
+  const level = String(value || "").trim().toLowerCase();
+  if (["low", "medium", "high"].includes(level)) return level;
+  return "medium";
+}
+
+function appendTilePolygon(tiles, object, tile, polygon) {
+  const key = `${object.layerId}:${tile[0]}:${tile[1]}`;
+  const entry = tiles.get(key) || {
+    layerId: object.layerId,
+    layerName: object.layerName,
+    zMm: object.zMm,
+    thicknessMm: object.thicknessMm,
+    tile,
+    objects: [],
+  };
+  entry.objects.push({
+    netId: object.netId,
+    objectFeatureId: object.objectFeatureId,
+    polygon,
+  });
+  tiles.set(key, entry);
 }
 
 function createDocument(tile, geometry) {
